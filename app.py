@@ -304,18 +304,18 @@ def page_assets_tags():
     
     # 1. 资产管理
     with tab1:
-        # --- 修改点 A: SQL 查询中增加 remarks ---
+        # --- 修改点: SQL 查询增加 currency ---
         assets_df = pd.read_sql(
-            'SELECT asset_id, name, code, type, remarks FROM assets WHERE user_id = ?', 
+            'SELECT asset_id, name, code, type, currency, remarks FROM assets WHERE user_id = ?', 
             conn, params=(user_id,)
         )
         
-        # 应用筛选
+        # 应用筛选 (保持不变)
         assets_df = apply_advanced_filters(assets_df, "tab1")
         
         st.caption(f"共显示 {len(assets_df)} 条资产")
         
-        # --- 修改点 B: 在编辑器中配置 remarks 列 ---
+        # --- 修改点: 配置 currency 列 ---
         edited_assets = st.data_editor(
             assets_df,
             num_rows="dynamic",
@@ -324,17 +324,24 @@ def page_assets_tags():
                 "name": st.column_config.TextColumn("资产名称", required=True),
                 "code": "代码",
                 "type": st.column_config.SelectboxColumn("大类", options=["基金", "股票", "债券", "现金", "其他"]),
-                "remarks": st.column_config.TextColumn("备注", width="medium", help="例如：养老金、准备卖出...") # 新增这一行
+                # 新增币种选择
+                "currency": st.column_config.SelectboxColumn(
+                    "币种", 
+                    options=["CNY", "USD", "HKD", "JPY", "EUR", "GBP", "BTC"],
+                    required=True,
+                    default="CNY",
+                    width="small"
+                ),
+                "remarks": st.column_config.TextColumn("备注", width="medium")
             },
             key="editor_assets",
             use_container_width=True
         )
         
         if st.button("💾 保存资产变动", type="primary"):
-            # save_changes_to_db 函数够聪明，它会自动检测到 DataFrame 里多了 remarks 列，
-            # 并自动生成对应的 SQL 更新语句，所以这里不需要改代码。
             if save_changes_to_db(edited_assets, assets_df, 'assets', 'asset_id', user_id, fixed_cols={'user_id': user_id}):
                 st.rerun()
+    
     # 2. 标签管理 (不需要筛选，逻辑不变)
     with tab2:
         tags_df = pd.read_sql('SELECT tag_id, tag_group, tag_name FROM tags WHERE user_id = ?', conn, params=(user_id,))
@@ -522,13 +529,65 @@ def page_data_entry():
         date = st.date_input("选择快照日期", datetime.now())
         str_date = date.strftime('%Y-%m-%d')
 
-    # 1. 准备基础数据
-    assets = pd.read_sql('SELECT asset_id, name, code FROM assets WHERE user_id = ?', conn, params=(user_id,))
+    # 1. 准备基础数据 (包含币种信息)
+    assets = pd.read_sql('SELECT asset_id, name, code, currency FROM assets WHERE user_id = ?', conn, params=(user_id,))
     
     if assets.empty:
-        st.warning("暂无资产。")
+        st.warning("暂无资产，请先去【资产与标签管理】添加资产。")
         conn.close()
         return
+
+    # --- 新增功能：汇率录入区 ---
+    # 检查当前用户拥有的资产涉及哪些外币
+    # 注意：需确保 assets 表已有 currency 字段 (通过运行 update_schema_v2.py)
+    if 'currency' in assets.columns:
+        unique_currencies = assets['currency'].unique().tolist()
+        foreign_currencies = [c for c in unique_currencies if c and c != 'CNY']
+    else:
+        foreign_currencies = []
+    
+    if foreign_currencies:
+        with st.expander(f"💱 设置当日汇率 ({str_date})", expanded=True):
+            st.caption("检测到您持有外币资产，请确认当日汇率（对人民币）：")
+            
+            # 获取数据库里已存的当日汇率
+            saved_rates = pd.read_sql(
+                "SELECT currency, rate FROM exchange_rates WHERE date = ?", 
+                conn, params=(str_date,)
+            )
+            saved_rate_map = dict(zip(saved_rates['currency'], saved_rates['rate']))
+            
+            # 动态生成输入框
+            cols = st.columns(len(foreign_currencies) + 1)
+            rates_to_save = {}
+            
+            for i, curr in enumerate(foreign_currencies):
+                # 默认值逻辑：当日已存 > 1.0
+                default_val = saved_rate_map.get(curr, 1.0)
+                
+                with cols[i]:
+                    r = st.number_input(
+                        f"{curr} ➡️ CNY", 
+                        value=float(default_val), 
+                        format="%.4f", 
+                        key=f"rate_{curr}_{str_date}"  # <--- 这里改了
+                    )                    
+                    rates_to_save[curr] = r
+            
+            with cols[-1]:
+                st.write("") # 占位
+                st.write("") 
+                if st.button("💾 保存汇率", type="secondary"):
+                    try:
+                        for curr, rate in rates_to_save.items():
+                            conn.execute(
+                                "INSERT OR REPLACE INTO exchange_rates (date, currency, rate) VALUES (?, ?, ?)",
+                                (str_date, curr, rate)
+                            )
+                        conn.commit()
+                        st.toast("汇率已更新", icon="💱")
+                    except Exception as e:
+                        st.error(f"汇率保存失败: {e}")
 
     # 2. 筛选与排序区域
     with st.expander("🔍 筛选与排序工具", expanded=True):
@@ -547,7 +606,7 @@ def page_data_entry():
                 opts = ["【无此标签】"] + t_df['tag_name'].tolist()
                 sel_tags = st.multiselect("标签名", opts)
 
-        # 第二行：排序条件 (新增功能)
+        # 第二行：排序条件
         st.divider()
         s1, s2 = st.columns([1, 3])
         with s1:
@@ -612,39 +671,45 @@ def page_data_entry():
         merged['profit'] = merged['profit'].fillna(0.0)
         merged['yield_rate'] = merged['yield_rate'].fillna(0.0)
 
-        # --- 5. 执行排序 (新增核心逻辑) ---
+        # --- 5. 执行排序 ---
         if "总金额 (高→低)" in sort_option:
             merged = merged.sort_values(by='amount', ascending=False)
         elif "总金额 (低→高)" in sort_option:
             merged = merged.sort_values(by='amount', ascending=True)
         elif "持有收益 (高→低)" in sort_option:
             merged = merged.sort_values(by='profit', ascending=False)
-        elif "持有收益 (低→高)" in sort_option: # 亏损最多的排前面
+        elif "持有收益 (低→高)" in sort_option:
             merged = merged.sort_values(by='profit', ascending=True)
         elif "收益率 (高→低)" in sort_option:
             merged = merged.sort_values(by='yield_rate', ascending=False)
         elif "收益率 (低→高)" in sort_option:
             merged = merged.sort_values(by='yield_rate', ascending=True)
-        # 默认按ID排序 (pandas 默认索引顺序)
-
+        
         # --- 6. 显示表格 ---
-        st.caption(f"当前显示: {len(merged)} 条")
+        st.caption(f"当前显示: {len(merged)} 条 | 💡 请直接录入 **原币种** 金额 (例如美元资产直接填 USD 金额)")
+
+        # 检查是否包含 currency 列，防止旧数据库报错
+        col_cfg = {
+            "asset_id": st.column_config.NumberColumn("ID", disabled=True, width="small"),
+            "name": st.column_config.TextColumn("资产名称", disabled=True),
+            "code": st.column_config.TextColumn("代码", disabled=True),
+            "amount": st.column_config.NumberColumn("💰 总市值 (原币)", format="%.2f", required=True),
+            "profit": st.column_config.NumberColumn("📈 持有收益 (原币)", format="%.2f", required=True),
+            "cost": st.column_config.NumberColumn("本金", disabled=True, format="%.2f"),
+            "yield_rate": st.column_config.NumberColumn("收益率", disabled=True, format="%.2f%%"),
+        }
+        
+        # 如果有 currency 字段，配置它
+        if 'currency' in merged.columns:
+            col_cfg["currency"] = st.column_config.TextColumn("币种", disabled=True, width="small")
 
         edited_snapshot = st.data_editor(
             merged,
-            column_config={
-                "asset_id": st.column_config.NumberColumn("ID", disabled=True, width="small"),
-                "name": st.column_config.TextColumn("资产名称", disabled=True),
-                "code": st.column_config.TextColumn("代码", disabled=True),
-                "amount": st.column_config.NumberColumn("💰 总市值", format="¥%.2f", required=True),
-                "profit": st.column_config.NumberColumn("📈 持有收益", format="¥%.2f", required=True),
-                "cost": st.column_config.NumberColumn("本金", disabled=True, format="¥%.2f"),
-                "yield_rate": st.column_config.NumberColumn("收益率", disabled=True, format="%.2f%%"),
-            },
+            column_config=col_cfg,
             hide_index=True,
             use_container_width=True,
-            # Key 加入 sort_option，保证切换排序时表格刷新
-            key=f"entry_{len(merged)}_{kw}_{sel_group}_{sort_option}"
+            # Key 加入 sort_option 等变量，保证状态刷新
+            key=f"entry_{len(merged)}_{kw}_{sel_group}_{sort_option}_{str_date}"
         )
 
         # --- 7. 保存逻辑 ---
@@ -654,7 +719,9 @@ def page_data_entry():
                 for _, row in edited_snapshot.iterrows():
                     amt = float(row['amount'])
                     prof = float(row['profit'])
+                    # 自动计算 Cost
                     cost = amt - prof
+                    # 自动计算 Yield Rate
                     y_rate = (prof / cost * 100) if cost != 0 else 0.0
                     
                     conn.execute('''
@@ -672,15 +739,23 @@ def page_data_entry():
 
     conn.close()
 
+def get_latest_rates(conn):
+    """获取系统中每种货币最新的汇率 (对CNY)"""
+    # 按日期降序排，去重取第一个
+    df = pd.read_sql("SELECT currency, rate, date FROM exchange_rates ORDER BY date DESC", conn)
+    if df.empty:
+        return {}
+    # drop_duplicates 默认保留第一个，也就是最新的
+    return df.drop_duplicates(subset=['currency']).set_index('currency')['rate'].to_dict()
+
 # --- 辅助函数：核心数据处理逻辑 ---
 def process_analytics_data(conn, user_id):
     """
-    提取所有快照数据并进行标签聚合。
-    因为数据库现在直接存储了 cost 和 profit，无需再倒推计算。
+    提取快照数据，并根据当天的汇率将所有非CNY资产折算为CNY。
     """
-    # 1. 获取基础数据 (直接读库，无需计算)
+    # 1. 获取基础数据 (增加 currency)
     df_raw = pd.read_sql('''
-        SELECT s.date, s.asset_id, s.amount, s.profit, s.cost, s.yield_rate, a.name
+        SELECT s.date, s.asset_id, s.amount, s.profit, s.cost, s.yield_rate, a.name, a.currency
         FROM snapshots s
         JOIN assets a ON s.asset_id = a.asset_id
         WHERE a.user_id = ?
@@ -691,7 +766,37 @@ def process_analytics_data(conn, user_id):
 
     df_raw['date'] = pd.to_datetime(df_raw['date'])
     
-    # 2. 获取标签关联关系
+    # 2. 获取汇率表
+    # 为了性能，一次性把汇率拉出来
+    df_rates = pd.read_sql("SELECT date, currency, rate FROM exchange_rates", conn)
+    df_rates['date'] = pd.to_datetime(df_rates['date'])
+    
+    # 3. 汇率匹配与折算
+    # 将汇率表 merge 到主表上
+    # left join: 如果找不到那天的汇率，我们会得到 NaN，后面处理成 1.0 (原样)
+    df_merged = pd.merge(
+        df_raw, 
+        df_rates, 
+        on=['date', 'currency'], 
+        how='left'
+    )
+    
+    # 填充汇率: 
+    # 1. 如果 currency 是 CNY，rate 设为 1
+    # 2. 如果是外币但没找到汇率，暂时设为 1 (或者可以做更复杂的向前填充)
+    df_merged['rate'] = df_merged.apply(
+        lambda row: 1.0 if row['currency'] == 'CNY' else row['rate'], axis=1
+    )
+    # 对于没填汇率的外币，给个默认值 1.0，避免计算变成 NaN
+    df_merged['rate'] = df_merged['rate'].fillna(1.0)
+    
+    # --- 核心折算 ---
+    # 所有后续分析都基于这两个 _cny 后缀的列
+    df_merged['amount_cny'] = df_merged['amount'] * df_merged['rate']
+    df_merged['profit_cny'] = df_merged['profit'] * df_merged['rate']
+    df_merged['cost_cny'] = df_merged['cost'] * df_merged['rate']
+    
+    # 4. 获取标签关联关系 (不变)
     df_tags = pd.read_sql('''
         SELECT t.tag_group, t.tag_name, atm.asset_id
         FROM tags t
@@ -699,50 +804,51 @@ def process_analytics_data(conn, user_id):
         WHERE t.user_id = ?
     ''', conn, params=(user_id,))
 
-    # 3. 标签维度聚合逻辑
+    # 5. 标签维度聚合 (使用折算后的人民币数值)
     tag_analytics = []
     
     if not df_tags.empty:
         # 将快照与标签关联
-        merged = pd.merge(df_raw, df_tags, on='asset_id', how='inner')
+        merged_tags = pd.merge(df_merged, df_tags, on='asset_id', how='inner')
         
-        # 统计每个标签下理论上的资产数量 (用于完整性检查)
         tag_asset_counts = df_tags.groupby(['tag_group', 'tag_name'])['asset_id'].nunique().to_dict()
-        
-        # 按 [日期, 标签组, 标签名] 聚合
-        grouped = merged.groupby(['date', 'tag_group', 'tag_name'])
+        grouped = merged_tags.groupby(['date', 'tag_group', 'tag_name'])
         
         for name, group in grouped:
             date, tag_group, tag_name = name
             
-            # 直接累加
-            total_amount = group['amount'].sum()
-            total_profit = group['profit'].sum()
-            total_cost = group['cost'].sum()
+            # 使用 _cny 列进行求和
+            total_amount = group['amount_cny'].sum()
+            total_profit = group['profit_cny'].sum()
+            total_cost = group['cost_cny'].sum()
             
-            # 重新计算聚合后的收益率: 总收益 / 总本金
-            # (不能简单平均，必须加权，这里用 总收益/总本金 最准)
             weighted_yield = (total_profit / total_cost * 100) if total_cost != 0 else 0.0
             
-            # 数据完整性检查
             current_count = group['asset_id'].nunique()
             expected_count = tag_asset_counts.get((tag_group, tag_name), 0)
-            is_complete = current_count == expected_count
             
             tag_analytics.append({
                 'date': date,
                 'tag_group': tag_group,
                 'tag_name': tag_name,
-                'amount': total_amount,
+                'amount': total_amount, # 此时已是人民币
                 'profit': total_profit,
-                'cost': total_cost, # 也可以展示本金趋势
+                'cost': total_cost,
                 'yield_rate': weighted_yield,
-                'is_complete': is_complete,
+                'is_complete': current_count == expected_count,
                 'missing_count': expected_count - current_count
             })
             
     df_tags_agg = pd.DataFrame(tag_analytics)
-    return df_raw, df_tags_agg
+    
+    # 返回原始数据时，建议也把 amount 替换成 amount_cny，这样 Dashboard 里的总览图（Tab 1）就不用改代码了
+    # 我们构造一个符合 Dashboard 预期的 df_assets
+    df_final_assets = df_merged.copy()
+    df_final_assets['amount'] = df_final_assets['amount_cny']
+    df_final_assets['profit'] = df_final_assets['profit_cny']
+    df_final_assets['cost'] = df_final_assets['cost_cny']
+    
+    return df_final_assets, df_tags_agg
 
 # --- 新版看板页面 ---
 def page_dashboard():
@@ -766,41 +872,51 @@ def page_dashboard():
     
     tab1, tab2, tab3 = st.tabs(["📈 趋势分析", "🍰 每日透视", "⚠️ 数据校验"])
 
-    # === TAB 1: 趋势分析 (保持不变) ===
+    # === TAB 1: 趋势分析 ===
     with tab1:
-        # --- 1. 总资产净值走势 ---
-        st.subheader("💰 总资产净值走势")
-        
+        # --- 1. 数据聚合与预处理 ---
         daily_total = df_assets.groupby('date')[['amount', 'profit', 'cost']].sum().reset_index()
+        daily_total = daily_total.sort_values('date') 
         
+        # 计算综合收益率
         daily_total['yield_rate'] = daily_total.apply(
             lambda row: (row['profit'] / row['cost'] * 100) if row['cost'] != 0 else 0.0, 
             axis=1
         )
         
+        # 单位换算 (万)
         daily_total['amount_w'] = daily_total['amount'] / 10000
         daily_total['profit_w'] = daily_total['profit'] / 10000
-        
+
+        # --- 风险指标计算 ---
+        ath_amount = daily_total['amount'].max()
+        current_amount = daily_total.iloc[-1]['amount']
+        current_drawdown_pct = (current_amount - ath_amount) / ath_amount if ath_amount > 0 else 0.0
+
+        daily_total['rolling_max'] = daily_total['amount'].cummax()
+        daily_total['daily_drawdown'] = (daily_total['amount'] - daily_total['rolling_max']) / daily_total['rolling_max']
+        daily_total['daily_drawdown'] = daily_total['daily_drawdown'].fillna(0.0)
+        max_drawdown_pct = daily_total['daily_drawdown'].min()
+
+        # --- 风险指标展示区 ---
+        st.subheader("🛡️ 风险与水位监控")
+        r1, r2, r3 = st.columns(3)
+        with r1:
+            st.metric("🏔️ 历史最高资产 (ATH)", f"{ath_amount/10000:,.2f}万")
+        with r2:
+            st.metric("📉 当前回撤", f"{current_drawdown_pct*100:.2f}%", 
+                      delta=f"{current_drawdown_pct*100:.2f}%", delta_color="inverse")
+        with r3:
+            st.metric("🌊 历史最大回撤 (MDD)", f"{max_drawdown_pct*100:.2f}%")
+            
+        st.divider()
+
+        # --- 2. 总资产净值走势图 ---
+        st.subheader("💰 总资产净值走势")
         fig_total = go.Figure()
-        fig_total.add_trace(go.Scatter(
-            x=daily_total['date'], y=daily_total['amount_w'],
-            name='总资产', mode='lines', fill='tozeroy', 
-            line=dict(color='#2E86C1', width=2),
-            hovertemplate='总资产: %{y:.2f}万<extra></extra>'
-        ))
-        fig_total.add_trace(go.Scatter(
-            x=daily_total['date'], y=daily_total['profit_w'],
-            name='持有收益', mode='lines',
-            line=dict(color='#27AE60', width=2), 
-            hovertemplate='持有收益: %{y:.2f}万<extra></extra>'
-        ))
-        fig_total.add_trace(go.Scatter(
-            x=daily_total['date'], y=daily_total['yield_rate'],
-            name='收益率', mode='lines',
-            line=dict(color='#E74C3C', width=2, dash='dot'), 
-            yaxis='y2',
-            hovertemplate='收益率: %{y:.2f}%<extra></extra>'
-        ))
+        fig_total.add_trace(go.Scatter(x=daily_total['date'], y=daily_total['amount_w'], name='总资产', mode='lines', fill='tozeroy', line=dict(color='#2E86C1', width=2), hovertemplate='总资产: %{y:.2f}万<extra></extra>'))
+        fig_total.add_trace(go.Scatter(x=daily_total['date'], y=daily_total['profit_w'], name='持有收益', mode='lines', line=dict(color='#27AE60', width=2), hovertemplate='持有收益: %{y:.2f}万<extra></extra>'))
+        fig_total.add_trace(go.Scatter(x=daily_total['date'], y=daily_total['yield_rate'], name='收益率', mode='lines', line=dict(color='#E74C3C', width=2, dash='dot'), yaxis='y2', hovertemplate='收益率: %{y:.2f}%<extra></extra>'))
         fig_total.update_layout(
             hovermode="x unified",
             yaxis=dict(title=dict(text="金额 (万)", font=dict(color="#2E86C1")), tickfont=dict(color="#2E86C1")),
@@ -810,40 +926,24 @@ def page_dashboard():
         st.plotly_chart(fig_total, use_container_width=True)
 
         csv_total = daily_total.to_csv(index=False).encode('utf-8-sig')
-        st.download_button(
-            label="📥 导出总资产趋势数据 (CSV)",
-            data=csv_total,
-            file_name=f'total_assets_trend_{datetime.now().strftime("%Y%m%d")}.csv',
-            mime='text/csv',
-            help="包含每日的总资产、总收益、总本金和综合收益率"
-        )
+        st.download_button(label="📥 导出总资产趋势数据 (CSV)", data=csv_total, file_name=f'total_assets_trend_{datetime.now().strftime("%Y%m%d")}.csv', mime='text/csv')
 
         st.divider()
 
-        # --- 2. 结构化趋势详细对比 ---
+        # --- 3. 结构化趋势详细对比 ---
         st.subheader("📊 结构化趋势详细对比")
         
         c1, c2, c3 = st.columns([1, 1, 2])
         with c1:
             view_mode = st.radio("分析维度", ["按具体资产", "按标签组"], horizontal=True, key="trend_view")
         with c2:
-            metric_type = st.selectbox("画图指标 (Y轴)", 
-                                     ["总金额 (Amount)", "持有收益 (Profit)", "收益率 (Yield %)", "占比 (Share %)"], 
-                                     key="trend_metric")
+            metric_type = st.selectbox("画图指标 (Y轴)", ["总金额 (Amount)", "持有收益 (Profit)", "收益率 (Yield %)", "占比 (Share %)"], key="trend_metric")
         with c3:
-            tooltip_extras = st.multiselect(
-                "🖱️ 悬停显示额外指标", 
-                ["总金额", "持有收益", "本金", "收益率", "占比"],
-                default=["占比", "持有收益", "收益率"], 
-                key="trend_tooltip"
-            )
+            tooltip_extras = st.multiselect("🖱️ 悬停显示额外指标", ["总金额", "持有收益", "本金", "收益率", "占比"], default=["占比", "持有收益", "收益率"], key="trend_tooltip")
 
         plot_df = None
         color_col = ""
-        y_col = ""
-        y_unit = ""
-        y_title = ""
-
+        
         if view_mode == "按具体资产":
             plot_df = df_assets.copy()
             color_col = "name"
@@ -857,54 +957,146 @@ def page_dashboard():
                 color_col = "tag_name"
         
         if plot_df is not None:
+            # 预计算绘图字段
             plot_df['amt_w'] = plot_df['amount'] / 10000
             plot_df['prof_w'] = plot_df['profit'] / 10000
             plot_df['cost_w'] = plot_df['cost'] / 10000
             daily_sums = plot_df.groupby('date')['amount'].transform('sum')
             plot_df['share'] = (plot_df['amount'] / daily_sums * 100).fillna(0)
 
-            if metric_type == "总金额 (Amount)":
-                y_col = "amt_w"; y_unit = "w"; y_title = "金额 (万)"
-            elif metric_type == "持有收益 (Profit)":
-                y_col = "prof_w"; y_unit = "w"; y_title = "收益 (万)"
-            elif metric_type == "收益率 (Yield %)":
-                y_col = "yield_rate"; y_unit = "%"; y_title = "收益率 (%)"
-            elif metric_type == "占比 (Share %)":
-                y_col = "share"; y_unit = "%"; y_title = "占比 (%)"
+            # 决定 Y 轴
+            y_col, y_unit, y_title = "amt_w", "w", "金额 (万)"
+            if metric_type.startswith("持有收益"): y_col, y_unit, y_title = "prof_w", "w", "收益 (万)"
+            elif metric_type.startswith("收益率"): y_col, y_unit, y_title = "yield_rate", "%", "收益率 (%)"
+            elif metric_type.startswith("占比"): y_col, y_unit, y_title = "share", "%", "占比 (%)"
 
+            # 绘图
             custom_data_cols = ['amt_w', 'prof_w', 'cost_w', 'yield_rate', 'share']
-            if metric_type == "占比 (Share %)":
+            if metric_type.startswith("占比"):
                 fig = px.area(plot_df, x='date', y=y_col, color=color_col, groupnorm='percent', custom_data=custom_data_cols)
             else:
                 fig = px.line(plot_df, x='date', y=y_col, color=color_col, markers=True, custom_data=custom_data_cols)
             
-            hover_html = f"<b>%{{fullData.name}}</b>: "
-            info_parts = []
-            info_parts.append(f"<b>{metric_type.split(' ')[0]}:%{{y:.2f}}{y_unit}</b>")
-            
-            if tooltip_extras:
-                if "总金额" in tooltip_extras: info_parts.append("💰%{customdata[0]:.2f}w")
-                if "持有收益" in tooltip_extras: info_parts.append("📈%{customdata[1]:.2f}w")
-                if "本金" in tooltip_extras: info_parts.append("🌱%{customdata[2]:.2f}w")
-                if "收益率" in tooltip_extras: info_parts.append("🚀%{customdata[3]:.1f}%")
-                if "占比" in tooltip_extras: info_parts.append("🍰%{customdata[4]:.1f}%")
-            
-            hover_html += "   ".join(info_parts)
+            # 定制 tooltip
+            hover_html = f"<b>%{{fullData.name}}</b>: <b>{metric_type.split(' ')[0]}:%{{y:.2f}}{y_unit}</b>"
+            extra_info = []
+            if "总金额" in tooltip_extras: extra_info.append("💰%{customdata[0]:.2f}w")
+            if "持有收益" in tooltip_extras: extra_info.append("📈%{customdata[1]:.2f}w")
+            if "本金" in tooltip_extras: extra_info.append("🌱%{customdata[2]:.2f}w")
+            if "收益率" in tooltip_extras: extra_info.append("🚀%{customdata[3]:.1f}%")
+            if "占比" in tooltip_extras: extra_info.append("🍰%{customdata[4]:.1f}%")
+            if extra_info: hover_html += "<br>" + "   ".join(extra_info)
             hover_html += "<extra></extra>"
+            
             fig.update_traces(hovertemplate=hover_html)
             fig.update_layout(hovermode="x unified", yaxis_title=y_title, legend_title_text="")
             st.plotly_chart(fig, use_container_width=True)
 
-            export_cols = ['date', color_col, 'amount', 'profit', 'cost', 'yield_rate', 'share']
-            csv_struct = plot_df[export_cols].to_csv(index=False).encode('utf-8-sig')
-            st.download_button(
-                label=f"📥 导出当前筛选数据 ({view_mode})",
-                data=csv_struct,
-                file_name=f'trend_structure_{view_mode}_{datetime.now().strftime("%Y%m%d")}.csv',
-                mime='text/csv'
-            )
+            csv_struct = plot_df.to_csv(index=False).encode('utf-8-sig')
+            st.download_button(label=f"📥 导出当前筛选数据 ({view_mode})", data=csv_struct, file_name=f'trend_structure.csv', mime='text/csv')
 
-    # === TAB 2: 每日透视 (核心修改区域) ===
+            # =========================================================
+            # 🔥 核心修改：分组柱状图对比 (美化 Tooltip 版)
+            # =========================================================
+            st.divider()
+            st.subheader("🆚 两期数据横向比对")
+            st.caption(f"对比维度：**{view_mode}** | 直观展示两个时间点的数值变化")
+            
+            valid_dates = sorted(plot_df['date'].unique())
+            if len(valid_dates) < 2:
+                st.warning("需要至少两天的数据才能进行对比。")
+            else:
+                with st.container():
+                    dc1, dc2, dc3 = st.columns([2, 2, 3])
+                    with dc1:
+                        d1 = st.selectbox("📅 日期 A (旧)", valid_dates, index=max(0, len(valid_dates)-2), 
+                                        format_func=lambda x: x.strftime('%Y-%m-%d'), key="diff_d1")
+                    with dc2:
+                        d2 = st.selectbox("📅 日期 B (新)", valid_dates, index=len(valid_dates)-1, 
+                                        format_func=lambda x: x.strftime('%Y-%m-%d'), key="diff_d2")
+                    with dc3:
+                        diff_metric = st.radio("对比指标", 
+                                             ["总金额 (Amount)", "持有收益 (Profit)", "收益率 (Yield %)", "占比 (Share %)"], 
+                                             horizontal=True)
+
+                if d1 == d2:
+                    st.info("请选择两个不同的日期。")
+                else:
+                    # 2. 准备数据
+                    if "总金额" in diff_metric: val_col = "amount"; unit_suffix = "元"
+                    elif "持有收益" in diff_metric: val_col = "profit"; unit_suffix = "元"
+                    elif "收益率" in diff_metric: val_col = "yield_rate"; unit_suffix = "%"
+                    elif "占比" in diff_metric: val_col = "share"; unit_suffix = "%"
+
+                    df_d1 = plot_df[plot_df['date'] == d1].copy()
+                    df_d1['Period'] = d1.strftime('%Y-%m-%d')
+                    
+                    df_d2 = plot_df[plot_df['date'] == d2].copy()
+                    df_d2['Period'] = d2.strftime('%Y-%m-%d')
+                    
+                    df_viz = pd.concat([df_d1, df_d2], ignore_index=True)
+                    
+                    # 排序
+                    rank_order = df_d2.sort_values(val_col, ascending=False)[color_col].tolist()
+                    
+                    # 4. 绘图
+                    fig_compare = px.bar(
+                        df_viz, 
+                        x=color_col, 
+                        y=val_col, 
+                        color='Period', 
+                        barmode='group', 
+                        title=f"{diff_metric} 对比: {d1.strftime('%m-%d')} vs {d2.strftime('%m-%d')}",
+                        category_orders={color_col: rank_order}, 
+                        text_auto='.2s' if unit_suffix == "元" else '.2f'
+                    )
+                    
+                    # --- 🔥 定制美化 Tooltip (Hovertemplate) ---
+                    # 逻辑: 
+                    # %{x} 是 X轴名称(资产名)
+                    # %{fullData.name} 是 Trace名称(也就是 Period 日期)
+                    # %{y} 是 数值
+                    metric_label = diff_metric.split(' ')[0]
+                    
+                    if unit_suffix == "元":
+                        # 金额格式: ¥1,234.56
+                        hover_template = f"<b>%{{x}}</b><br>📅 %{{fullData.name}}<br>{metric_label}: <b>¥%{{y:,.2f}}</b><extra></extra>"
+                    else:
+                        # 百分比格式: 12.34%
+                        hover_template = f"<b>%{{x}}</b><br>📅 %{{fullData.name}}<br>{metric_label}: <b>%{{y:.2f}}%</b><extra></extra>"
+
+                    fig_compare.update_traces(hovertemplate=hover_template)
+
+                    fig_compare.update_layout(
+                        yaxis_title=diff_metric,
+                        xaxis_title="",
+                        legend_title_text="",
+                        hovermode="x unified" # 开启统一悬停，方便左右对比
+                    )
+                    st.plotly_chart(fig_compare, use_container_width=True)
+
+                    # 5. 辅助数据表
+                    with st.expander(f"查看 {diff_metric} 具体变动数值"):
+                        df_pivot = df_viz.pivot(index=color_col, columns='Period', values=val_col).reset_index()
+                        d1_str = d1.strftime('%Y-%m-%d')
+                        d2_str = d2.strftime('%Y-%m-%d')
+                        df_pivot = df_pivot.fillna(0)
+                        df_pivot['变动量'] = df_pivot[d2_str] - df_pivot[d1_str]
+                        df_pivot = df_pivot.sort_values(d2_str, ascending=False)
+                        
+                        st.dataframe(
+                            df_pivot,
+                            column_config={
+                                color_col: "名称",
+                                d1_str: st.column_config.NumberColumn(f"{d1_str}", format="%.2f"),
+                                d2_str: st.column_config.NumberColumn(f"{d2_str}", format="%.2f"),
+                                "变动量": st.column_config.NumberColumn("变动量", format="%.2f", help="正数表示增加，负数表示减少"),
+                            },
+                            hide_index=True,
+                            use_container_width=True
+                        )
+
+    # === TAB 2 & TAB 3 (保持不变) ===
     with tab2:
         st.subheader("🍰 每日资产快照分析")
         
@@ -1038,7 +1230,7 @@ def page_dashboard():
         else:
             st.info("该日期/维度下无数据。")
 
-    # === TAB 3 ===
+    # === TAB 3 (保持不变) ===
     with tab3:
         st.subheader("⚠️ 数据完整性检查")
         if df_tags is not None and not df_tags.empty:
@@ -1062,30 +1254,27 @@ def page_investment_plans():
 
     # === TAB 1: 计划管理 (CRUD) ===
     with tab1:
-        st.caption("在这里管理你的自动定投计划（仅用于统计未来资金需求，不会自动记账）。")
+        st.caption("在这里管理你的自动定投计划。注意：这里的金额是指【原币种】金额。")
         
         # 1. 新增计划表单 (带高级筛选)
         with st.expander("➕ 新增定投计划", expanded=True):
             
             # --- A. 准备基础数据 ---
-            all_assets = pd.read_sql('SELECT asset_id, name, code FROM assets WHERE user_id = ?', conn, params=(user_id,))
+            # 修改：同时读取 currency
+            all_assets = pd.read_sql('SELECT asset_id, name, code, currency FROM assets WHERE user_id = ?', conn, params=(user_id,))
             
             if all_assets.empty:
                 st.warning("⚠️ 请先去【资产与标签管理】页面添加至少一个资产。")
             else:
-                # --- B. 筛选工具栏 (新增) ---
+                # --- B. 筛选工具栏 (逻辑保持不变，略微省略以节省篇幅，直接使用) ---
                 st.markdown("##### 🔍 第一步：筛选资产")
                 f_col1, f_col2, f_col3 = st.columns([2, 1, 2])
-                
                 with f_col1:
                     filter_kw = st.text_input("关键字搜索", placeholder="名称/代码...", key="plan_filter_kw")
-                
                 with f_col2:
-                    # 获取标签组
                     all_groups = pd.read_sql("SELECT DISTINCT tag_group FROM tags WHERE user_id = ?", conn, params=(user_id,))
                     grp_list = ["(不筛选)"] + all_groups['tag_group'].tolist()
                     sel_group = st.selectbox("标签组", grp_list, key="plan_filter_group")
-                
                 with f_col3:
                     sel_tags = []
                     if sel_group != "(不筛选)":
@@ -1093,15 +1282,11 @@ def page_investment_plans():
                         opts = ["【无此标签】"] + t_df['tag_name'].tolist()
                         sel_tags = st.multiselect("标签状态", opts, key="plan_filter_tags")
 
-                # --- C. 执行筛选逻辑 ---
+                # 筛选逻辑...
                 filtered_ids = set(all_assets['asset_id'].tolist())
-                
-                # 1. 关键字
                 if filter_kw:
                     matched = all_assets[all_assets['name'].str.contains(filter_kw, case=False) | all_assets['code'].str.contains(filter_kw, case=False, na=False)]
                     filtered_ids = filtered_ids.intersection(set(matched['asset_id']))
-                
-                # 2. 标签
                 if sel_group != "(不筛选)" and sel_tags:
                     sql_labeled = '''
                         SELECT atm.asset_id, t.tag_name 
@@ -1109,18 +1294,12 @@ def page_investment_plans():
                         WHERE t.user_id = ? AND t.tag_group = ?
                     '''
                     df_labeled = pd.read_sql(sql_labeled, conn, params=(user_id, sel_group))
-                    
                     target_group_ids = set()
-                    if "【无此标签】" in sel_tags:
-                        target_group_ids.update(filtered_ids - set(df_labeled['asset_id']))
-                    
+                    if "【无此标签】" in sel_tags: target_group_ids.update(filtered_ids - set(df_labeled['asset_id']))
                     real_tags = [t for t in sel_tags if t != "【无此标签】"]
-                    if real_tags:
-                        target_group_ids.update(set(df_labeled[df_labeled['tag_name'].isin(real_tags)]['asset_id']))
-                        
+                    if real_tags: target_group_ids.update(set(df_labeled[df_labeled['tag_name'].isin(real_tags)]['asset_id']))
                     filtered_ids = filtered_ids.intersection(target_group_ids)
                 
-                # --- D. 渲染结果与表单 ---
                 final_assets = all_assets[all_assets['asset_id'].isin(filtered_ids)].copy()
                 
                 st.divider()
@@ -1131,27 +1310,25 @@ def page_investment_plans():
                 else:
                     c1, c2 = st.columns(2)
                     with c1:
-                        # 下拉框只显示筛选后的资产
+                        # 格式化显示：加入币种信息
                         sel_asset = st.selectbox(
                             f"选择资产 (当前筛选出 {len(final_assets)} 个)", 
                             options=final_assets['asset_id'], 
-                            format_func=lambda x: final_assets[final_assets['asset_id']==x]['name'].values[0],
+                            format_func=lambda x: f"{final_assets[final_assets['asset_id']==x]['name'].values[0]} ({final_assets[final_assets['asset_id']==x]['currency'].values[0]})",
                             key="plan_new_asset"
                         )
-                        amount = st.number_input("每次定投金额", min_value=0.0, step=100.0, key="plan_new_amount")
+                        # 获取选中资产的币种，提示用户
+                        curr_symbol = final_assets[final_assets['asset_id']==sel_asset]['currency'].values[0]
+                        amount = st.number_input(f"每次定投金额 (单位: {curr_symbol})", min_value=0.0, step=100.0, key="plan_new_amount")
                     
                     with c2:
                         freq = st.selectbox("频率", ["每周", "每月", "每天"], key="plan_new_freq")
-                        
                         exec_day = 0
                         if freq == "每周":
                             weekdays = {0:"周一", 1:"周二", 2:"周三", 3:"周四", 4:"周五", 5:"周六", 6:"周日"}
-                            exec_day = st.selectbox("选择周几", options=list(weekdays.keys()), 
-                                                  format_func=lambda x: weekdays[x],
-                                                  key="plan_new_day_week")
+                            exec_day = st.selectbox("选择周几", options=list(weekdays.keys()), format_func=lambda x: weekdays[x], key="plan_new_day_week")
                         elif freq == "每月":
-                            exec_day = st.number_input("选择每月几号 (建议1-28日)", min_value=1, max_value=28, value=1,
-                                                     key="plan_new_day_month")
+                            exec_day = st.number_input("选择每月几号", min_value=1, max_value=28, value=1, key="plan_new_day_month")
 
                     st.write("") 
                     
@@ -1165,16 +1342,17 @@ def page_investment_plans():
                                     VALUES (?, ?, ?, ?, ?)
                                 ''', (user_id, sel_asset, amount, freq, exec_day))
                                 conn.commit()
-                                st.success(f"✅ 已添加对【{final_assets[final_assets['asset_id']==sel_asset]['name'].values[0]}】的定投计划！")
+                                st.success(f"✅ 已添加定投计划！")
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"保存失败: {e}")
 
-        # 2. 现有计划列表 (保持不变)
+        # 2. 现有计划列表
         st.subheader("📋 正在运行的计划")
         
+        # 修改：同时查出 assets 表的 currency
         plans_df = pd.read_sql('''
-            SELECT p.plan_id, a.name, p.amount, p.frequency, p.execution_day, p.is_active
+            SELECT p.plan_id, a.name, a.currency, p.amount, p.frequency, p.execution_day, p.is_active
             FROM investment_plans p
             JOIN assets a ON p.asset_id = a.asset_id
             WHERE p.user_id = ?
@@ -1196,7 +1374,8 @@ def page_investment_plans():
                 column_config={
                     "plan_id": st.column_config.NumberColumn("ID", disabled=True, width="small"),
                     "name": st.column_config.TextColumn("资产名称", disabled=True),
-                    "amount": st.column_config.NumberColumn("金额", format="¥%.2f"),
+                    "currency": st.column_config.TextColumn("币种", disabled=True, width="small"),
+                    "amount": st.column_config.NumberColumn("金额 (原币)", format="%.2f"),
                     "frequency": st.column_config.TextColumn("频率", disabled=True),
                     "execution_day": None, 
                     "描述": st.column_config.TextColumn("定投时间", disabled=True),
@@ -1214,20 +1393,22 @@ def page_investment_plans():
         else:
             st.info("暂无定投计划。")
 
-    # === TAB 2: 现金流看板 ===
+    # === TAB 2: 现金流看板 (核心修改) ===
     with tab2:
         # 1. 计算未来现金流逻辑
-        st.subheader("🗓️ 未来 30 天资金需求推演")
+        st.subheader("🗓️ 未来 30 天资金需求推演 (折合人民币)")
         
-        # 获取所有启用的计划
+        # 获取最新汇率表
+        rates_map = get_latest_rates(conn)
+        
+        # 获取所有启用的计划 (包含币种)
         active_plans = pd.read_sql('''
-            SELECT p.asset_id, a.name, p.amount, p.frequency, p.execution_day
+            SELECT p.asset_id, a.name, a.currency, p.amount, p.frequency, p.execution_day
             FROM investment_plans p
             JOIN assets a ON p.asset_id = a.asset_id
             WHERE p.user_id = ? AND p.is_active = 1
         ''', conn, params=(user_id,))
         
-        # 获取资产的标签信息
         asset_tags = pd.read_sql('''
             SELECT atm.asset_id, t.tag_group, t.tag_name
             FROM asset_tag_map atm
@@ -1238,31 +1419,34 @@ def page_investment_plans():
         if active_plans.empty:
             st.info("请先启用至少一个定投计划。")
         else:
-            # 推演未来30天
             today = datetime.now().date()
             future_days = 30
             projection_data = []
 
             for i in range(future_days):
                 current_date = today + timedelta(days=i)
-                current_weekday = current_date.weekday() # 0=周一
+                current_weekday = current_date.weekday()
                 current_day = current_date.day
                 
                 for _, plan in active_plans.iterrows():
                     hit = False
-                    if plan['frequency'] == '每天':
-                        hit = True
-                    elif plan['frequency'] == '每周' and int(plan['execution_day']) == current_weekday:
-                        hit = True
-                    elif plan['frequency'] == '每月' and int(plan['execution_day']) == current_day:
-                        hit = True
+                    if plan['frequency'] == '每天': hit = True
+                    elif plan['frequency'] == '每周' and int(plan['execution_day']) == current_weekday: hit = True
+                    elif plan['frequency'] == '每月' and int(plan['execution_day']) == current_day: hit = True
                     
                     if hit:
+                        # 🔥 核心修正：金额折算
+                        raw_amt = plan['amount']
+                        curr = plan['currency']
+                        rate = 1.0 if curr == 'CNY' else rates_map.get(curr, 1.0)
+                        cny_amt = raw_amt * rate
+                        
                         projection_data.append({
                             "date": current_date,
                             "asset_id": plan['asset_id'],
                             "asset_name": plan['name'],
-                            "amount": plan['amount']
+                            "amount_cny": cny_amt, # 使用折算后的金额
+                            "raw_info": f"{raw_amt} {curr}" # 备注原币金额
                         })
 
             if not projection_data:
@@ -1270,68 +1454,52 @@ def page_investment_plans():
             else:
                 df_proj = pd.DataFrame(projection_data)
                 
-                # --- 可视化 A: 总览 ---
-                total_needed = df_proj['amount'].sum()
+                # --- 可视化 A: 总览 (CNY) ---
+                total_needed = df_proj['amount_cny'].sum()
                 col1, col2 = st.columns(2)
-                col1.metric("未来 30 天总定投金额", f"¥{total_needed:,.2f}")
-                col2.metric("平均每日资金流出", f"¥{total_needed/30:,.2f}")
+                col1.metric("未来 30 天总定投 (CNY)", f"¥{total_needed:,.2f}")
+                col2.metric("平均每日流出 (CNY)", f"¥{total_needed/30:,.2f}")
 
                 st.divider()
 
-                # --- 可视化 B: 堆叠柱状图 (升级版) ---
-                
-                # 1. 维度选择
+                # --- 可视化 B: 堆叠柱状图 ---
                 all_groups = asset_tags['tag_group'].unique().tolist() if not asset_tags.empty else []
-                # 新增 "按具体资产" 选项
                 dim_options = ["按具体资产"] + all_groups
                 selected_dim = st.selectbox("选择分析维度 (堆叠方式)", dim_options)
                 
-                # 2. 数据处理与聚合
                 df_viz = df_proj.copy()
                 
                 if selected_dim == "按具体资产":
-                    # 直接使用资产名作为分类
                     df_viz['category'] = df_viz['asset_name']
                 else:
-                    # 按标签组关联
                     tags_in_group = asset_tags[asset_tags['tag_group'] == selected_dim]
                     df_viz = pd.merge(df_viz, tags_in_group, on='asset_id', how='left')
                     df_viz['tag_name'] = df_viz['tag_name'].fillna('未分类')
                     df_viz['category'] = df_viz['tag_name']
 
-                # 核心聚合：按 [日期, 分类] 汇总金额
-                # 这样如果同一天有两个 "高风险" 资产，它们会合并成一个 "高风险" 的柱子片段
-                df_agg = df_viz.groupby(['date', 'category'])['amount'].sum().reset_index()
+                # 按 amount_cny 聚合
+                df_agg = df_viz.groupby(['date', 'category'])['amount_cny'].sum().reset_index()
                 
-                # 计算每日占比 (用于悬停显示)
-                # 算出每天的总金额
-                daily_totals = df_agg.groupby('date')['amount'].transform('sum')
-                # 计算当前分类占当天的比例
-                df_agg['share'] = (df_agg['amount'] / daily_totals) * 100
+                daily_totals = df_agg.groupby('date')['amount_cny'].transform('sum')
+                df_agg['share'] = (df_agg['amount_cny'] / daily_totals) * 100
 
-                # 3. 绘图
                 fig = px.bar(
                     df_agg, 
                     x='date', 
-                    y='amount', 
+                    y='amount_cny', 
                     color='category',
-                    title=f"未来 30 天每日定投分布 ({selected_dim})",
-                    labels={'amount': '金额', 'date': '日期', 'category': '类别'},
-                    # 把占比数据传进去，方便 tooltip 调用
+                    title=f"未来 30 天每日定投分布 ({selected_dim}) - 折合人民币",
+                    labels={'amount_cny': '金额 (CNY)', 'date': '日期', 'category': '类别'},
                     custom_data=['share'] 
                 )
                 
-                # 4. 样式优化 (核心修改)
-                # hovertemplate: 定制每一行的显示格式
-                # %{customdata[0]:.1f}% 读取上面传入的 share 数据
                 fig.update_traces(
                     hovertemplate='<b>%{fullData.name}</b>: ¥%{y:,.0f} (%{customdata[0]:.1f}%)<extra></extra>'
                 )
                 
-                # hovermode="x unified": 开启统一悬停框，鼠标指到哪一天，显示那一天所有类别的数据
                 fig.update_layout(
                     hovermode="x unified",
-                    legend_title_text="" # 隐藏图例标题更清爽
+                    legend_title_text="" 
                 )
                 
                 st.plotly_chart(fig, use_container_width=True)
@@ -1343,11 +1511,198 @@ def page_investment_plans():
                         column_config={
                             "date": "日期",
                             "asset_name": "扣款资产",
-                            "amount": st.column_config.NumberColumn("扣款金额", format="¥%.2f")
+                            "amount_cny": st.column_config.NumberColumn("折合金额 (CNY)", format="¥%.2f"),
+                            "raw_info": "原币金额"
                         },
                         hide_index=True,
                         use_container_width=True
                     )
+
+    conn.close()
+
+def page_rebalance():
+    st.header("⚖️ 投资组合再平衡助手")
+    st.caption("设定你的理想资产配比，系统将计算如何调整仓位以维持风险平衡。")
+    
+    user_id = st.session_state.user['user_id']
+    conn = get_db_connection()
+
+    # --- 1. 选择要进行再平衡的维度 ---
+    # 通常我们只对大的维度做再平衡，比如 "资产大类" (股/债/金) 或 "风险等级"
+    all_groups = pd.read_sql("SELECT DISTINCT tag_group FROM tags WHERE user_id = ?", conn, params=(user_id,))
+    
+    if all_groups.empty:
+        st.warning("请先去设置标签。")
+        conn.close()
+        return
+
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        # 默认尝试选中 "资产大类" 或 "风险等级"，如果没有就选第一个
+        default_idx = 0
+        groups_list = all_groups['tag_group'].tolist()
+        if "资产大类" in groups_list: default_idx = groups_list.index("资产大类")
+        elif "风险等级" in groups_list: default_idx = groups_list.index("风险等级")
+        
+        selected_group = st.selectbox("选择配置维度", groups_list, index=default_idx)
+
+    # --- 2. 获取当前持仓数据 (Real) ---
+    # 注意：这里需要复用 process_analytics_data 里的逻辑，获取基于最新汇率折算后的 CNY 价值
+    # 为了简单，我们直接调用 process_analytics_data (稍微有点性能浪费但逻辑最稳)
+    _, df_tags = process_analytics_data(conn, user_id)
+    
+    if df_tags is None or df_tags.empty:
+        st.info("暂无资产数据。")
+        conn.close()
+        return
+
+    # 过滤出当前维度的最新数据
+    latest_date = df_tags['date'].max()
+    current_portfolio = df_tags[
+        (df_tags['date'] == latest_date) & 
+        (df_tags['tag_group'] == selected_group)
+    ].copy()
+    
+    total_asset_val = current_portfolio['amount'].sum() # 总资产 (CNY)
+
+    # --- 3. 获取/设置目标配置 (Target) ---
+    # 读取已保存的目标
+    saved_targets = pd.read_sql(
+        "SELECT tag_name, target_percentage FROM rebalance_targets WHERE user_id = ? AND tag_group = ?",
+        conn, params=(user_id, selected_group)
+    )
+    
+    # 构造编辑表格数据
+    # 拿到该组下所有的标签名
+    all_tags_in_group = pd.read_sql(
+        "SELECT tag_name FROM tags WHERE user_id = ? AND tag_group = ?", 
+        conn, params=(user_id, selected_group)
+    )
+    
+    # 合并：标签名 + 现有目标 + 当前持仓
+    # 这样即使用户还没持有某个标签的资产，也能给它设目标（准备买入）
+    df_editor = pd.merge(all_tags_in_group, saved_targets, on='tag_name', how='left')
+    df_editor['target_percentage'] = df_editor['target_percentage'].fillna(0.0)
+    
+    # 关联当前实际持仓占比，方便参考
+    current_portfolio['actual_percentage'] = (current_portfolio['amount'] / total_asset_val * 100)
+    df_editor = pd.merge(df_editor, current_portfolio[['tag_name', 'actual_percentage']], on='tag_name', how='left')
+    df_editor['actual_percentage'] = df_editor['actual_percentage'].fillna(0.0)
+    
+    st.divider()
+    
+    c_edit, c_chart = st.columns([2, 3])
+    
+    with c_edit:
+        st.subheader("🎯 设定目标比例")
+        st.caption("请直接在表格中修改【目标占比】，总和应为 100%。")
+        
+        edited_df = st.data_editor(
+            df_editor[['tag_name', 'target_percentage', 'actual_percentage']],
+            column_config={
+                "tag_name": st.column_config.TextColumn("类别", disabled=True),
+                "target_percentage": st.column_config.NumberColumn("目标占比 (%)", min_value=0, max_value=100, step=1.0, required=True),
+                "actual_percentage": st.column_config.NumberColumn("当前占比 (%)", disabled=True, format="%.2f%%"),
+            },
+            hide_index=True,
+            use_container_width=True,
+            key=f"rebalance_editor_{selected_group}"
+        )
+        
+        current_sum = edited_df['target_percentage'].sum()
+        if abs(current_sum - 100) > 0.01:
+            st.warning(f"⚠️ 当前目标总和为 {current_sum:.2f}%，请调整至 100%。")
+        else:
+            if st.button("💾 保存配置", type="primary"):
+                # 保存逻辑
+                try:
+                    conn.execute("DELETE FROM rebalance_targets WHERE user_id = ? AND tag_group = ?", (user_id, selected_group))
+                    for _, row in edited_df.iterrows():
+                        if row['target_percentage'] > 0:
+                            conn.execute(
+                                "INSERT INTO rebalance_targets (user_id, tag_group, tag_name, target_percentage) VALUES (?, ?, ?, ?)",
+                                (user_id, selected_group, row['tag_name'], row['target_percentage'])
+                            )
+                    conn.commit()
+                    st.success("配置已保存！")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"保存失败: {e}")
+
+    # --- 4. 计算与展示再平衡建议 ---
+    if abs(current_sum - 100) <= 0.01:
+        with c_chart:
+            st.subheader("📊 偏差分析")
+            
+            # 准备绘图数据
+            # 比较 Target vs Actual
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=edited_df['tag_name'],
+                y=edited_df['actual_percentage'],
+                name='当前实际',
+                marker_color='#95A5A6'
+            ))
+            fig.add_trace(go.Bar(
+                x=edited_df['tag_name'],
+                y=edited_df['target_percentage'],
+                name='理想目标',
+                marker_color='#3498DB'
+            ))
+            fig.update_layout(barmode='group', title=f"实际 vs 目标 ({selected_group})", hovermode="x unified")
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.divider()
+        st.subheader("💊 再平衡操作建议")
+        st.caption(f"基于当前总资产折合人民币：¥{total_asset_val:,.2f}")
+
+        # 计算具体买卖金额
+        # 逻辑：理想金额 = 总资产 * 目标% - 实际持有的金额
+        # 注意：这里我们假设总资产不变（即通过卖出多的买入少的，或者用新增资金去填补）
+        
+        # 重新merge一下确保数据最新
+        # 需要把 edited_df 里的 target_percentage 和 current_portfolio 里的 amount 结合
+        # current_portfolio 可能缺某些 tag（如果还没买），所以要以 edited_df 为主
+        
+        # 构造一个完整的计算表
+        df_calc = pd.merge(
+            edited_df[['tag_name', 'target_percentage']], 
+            current_portfolio[['tag_name', 'amount']], 
+            on='tag_name', 
+            how='left'
+        )
+        df_calc['amount'] = df_calc['amount'].fillna(0.0)
+        
+        # 核心计算
+        df_calc['target_amount'] = total_asset_val * (df_calc['target_percentage'] / 100.0)
+        df_calc['diff_amount'] = df_calc['target_amount'] - df_calc['amount']
+        
+        # 分类建议
+        to_buy = df_calc[df_calc['diff_amount'] > 100].sort_values('diff_amount', ascending=False) # 忽略小额噪音
+        to_sell = df_calc[df_calc['diff_amount'] < -100].sort_values('diff_amount', ascending=True)
+        
+        col_buy, col_sell = st.columns(2)
+        
+        with col_buy:
+            if not to_buy.empty:
+                st.success("🔵 建议买入 / 加仓")
+                for _, row in to_buy.iterrows():
+                    st.markdown(f"**{row['tag_name']}**: 需买入 **¥{row['diff_amount']:,.0f}**")
+                    st.progress(min(1.0, row['amount'] / row['target_amount']) if row['target_amount']>0 else 0)
+            else:
+                st.write("✅ 无需买入")
+
+        with col_sell:
+            if not to_sell.empty:
+                st.error("🔴 建议卖出 / 减仓")
+                for _, row in to_sell.iterrows():
+                    sell_val = abs(row['diff_amount'])
+                    st.markdown(f"**{row['tag_name']}**: 需卖出 **¥{sell_val:,.0f}**")
+                    # 进度条展示超配程度
+                    over_ratio = (row['amount'] - row['target_amount']) / row['target_amount'] if row['target_amount']>0 else 1
+                    st.progress(min(1.0, over_ratio))
+            else:
+                st.write("✅ 无需卖出")
 
     conn.close()
 
@@ -1485,22 +1840,33 @@ def page_fire_projection():
     user_id = st.session_state.user['user_id']
     conn = get_db_connection()
     
-    # --- 1. 获取当前总资产 (起点) ---
+    # --- 1. 获取当前总资产 (起点) - 多币种修正版 ---
+    # A. 获取最新汇率
+    rates_map = get_latest_rates(conn)
+    
+    # B. 获取最新一天的快照数据 (带币种)
     latest_date_row = conn.execute('SELECT MAX(date) as d FROM snapshots JOIN assets ON snapshots.asset_id = assets.asset_id WHERE assets.user_id = ?', (user_id,)).fetchone()
     
-    current_total_assets = 0.0
+    current_total_assets_cny = 0.0
     start_year = datetime.now().year
     
     if latest_date_row and latest_date_row['d']:
         latest_date = latest_date_row['d']
-        res = conn.execute('''
-            SELECT SUM(amount) as total 
+        # 查出每个资产的原币种金额和币种类型
+        rows = conn.execute('''
+            SELECT s.amount, a.currency
             FROM snapshots s
             JOIN assets a ON s.asset_id = a.asset_id
             WHERE a.user_id = ? AND s.date = ?
-        ''', (user_id, latest_date)).fetchone()
-        if res and res['total']:
-            current_total_assets = res['total']
+        ''', (user_id, latest_date)).fetchall()
+        
+        # C. 逐个折算并累加
+        for row in rows:
+            amt = row['amount']
+            curr = row['currency']
+            # 如果是 CNY 则汇率为 1，否则查表，查不到默认为 1
+            rate = 1.0 if curr == 'CNY' else rates_map.get(curr, 1.0)
+            current_total_assets_cny += amt * rate
             
     conn.close()
 
@@ -1510,8 +1876,8 @@ def page_fire_projection():
         with c1:
             # 修改点：单位改为万元，默认值除以10000
             base_amount_wan = st.number_input(
-                "当前总资产 (万元)", 
-                value=float(current_total_assets) / 10000.0, 
+                "当前总资产 (折合人民币/万元)", 
+                value=float(current_total_assets_cny) / 10000.0, 
                 step=1.0, 
                 format="%.2f"
             )
@@ -1643,7 +2009,7 @@ def page_fire_projection():
         )
 
     fig.update_layout(
-        title="未来 50 年资产增长趋势 (单位: 万)",
+        title="未来 50 年资产增长趋势 (单位: 万 CNY)",
         xaxis_title="年份",
         yaxis_title="金额 (万)",
         hovermode="x unified",
@@ -1669,7 +2035,7 @@ def page_fire_projection():
 
         st.markdown(f"""
         ### 💡 人生财富剧本
-        假设你从 **{current_age}岁** 开始，现有 **{base_amount_wan:.2f}万**，保持 **{annual_rate}%** 的年化收益，每年坚持定投 **{annual_addition_wan:.1f}万**：
+        假设你从 **{current_age}岁** 开始，现有 **{base_amount_wan:.2f}万 (CNY)**，保持 **{annual_rate}%** 的年化收益，每年坚持定投 **{annual_addition_wan:.1f}万**：
         
         * **{p10['age']}岁 ({p10['year']}年)**：资产达到 **{p10['balance_w']:.0f}万**（本金 {p10['principal_w']:.0f}万 + 收益 {p10['profit_w']:.0f}万）。
         * **{p20['age']}岁 ({p20['year']}年)**：资产达到 **{p20['balance_w']:.0f}万**。
@@ -2049,6 +2415,7 @@ def main():
                 "nav_assets", 
                 "nav_entry", 
                 "nav_plans", 
+                "nav_rebalance",
                 "nav_fire", 
                 "nav_settings"
             ]
@@ -2081,6 +2448,8 @@ def main():
             page_fire_projection()
         elif selected_key == "nav_settings":
             page_settings()
+        elif selected_key == "nav_rebalance":
+            page_rebalance()
 
 if __name__ == '__main__':
     main()
