@@ -1,0 +1,54 @@
+*.db
+*.db-journal
+asset_tracker.db
+asset_tracker_backup.db
+
+# --- 备份文件夹 ---
+backups/
+
+# --- Python 垃圾文件 ---
+__pycache__/
+*.pyc
+
+# --- 系统生成的垃圾文件 ---
+.DS_Store
+Thumbs.db
+
+# --- 虚拟环境 (如果有) ---
+venv/
+env/
+.venv/
+
+
+```powershell
+git branch -m master main
+
+```
+
+*(这行命令的意思是：把当前的 master 分支改名为 main)*
+
+### 第三步：验证并提交 (一套连招)
+
+做完上面两步后，请依次执行下面的命令：
+
+```powershell
+# 1. 再次查看状态 (这一步非常重要！)
+# 你应该发现 asset_tracker.db 和 backups/ 已经彻底从列表中消失了
+git status
+
+# 2. 如果确认看不见 .db 文件了，添加所有剩余文件
+git add .
+
+# 3. 提交到本地
+git commit -m "Initial commit: FIRE dashboard project structure"
+
+# 4. 解决刚才的 "Permission denied" 问题 (改用 HTTPS 协议，方便登录)
+git remote set-url origin https://github.com/chaishilin/myFirePlan.git
+
+# 5. 推送到 GitHub (这时会弹窗让你登录 GitHub 账号)
+git push -u origin main
+
+```
+
+**成功标志：**
+执行完最后一步后，终端显示 `Branch 'main' set up to track remote branch 'main' from 'origin'`，说明代码已经安全上传，且敏感数据被留在了本地。
