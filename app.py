@@ -18,6 +18,14 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
 from languages import TRANSLATIONS
 
+# 🔥 修改这里：智能判断数据库路径
+# 如果系统里有 /share 这个文件夹，说明是在 HA 里，就把数据库存那里
+if os.path.exists('/share'):
+    DB_FILE = '/share/asset_tracker.db'
+else:
+    # 否则（在电脑开发时）存当前目录
+    DB_FILE = 'asset_tracker.db'
+    
 # --- 兼容性修复 ---
 # 某些旧版库可能还在找 np.bool8，这里做一个简单的映射防止报错
 if not hasattr(np, 'bool8'):
@@ -529,7 +537,7 @@ def page_data_entry():
         date = st.date_input("选择快照日期", datetime.now())
         str_date = date.strftime('%Y-%m-%d')
 
-    # 1. 准备基础数据 (包含币种信息)
+    # 1. 准备基础数据 (包含币种)
     assets = pd.read_sql('SELECT asset_id, name, code, currency FROM assets WHERE user_id = ?', conn, params=(user_id,))
     
     if assets.empty:
@@ -537,9 +545,7 @@ def page_data_entry():
         conn.close()
         return
 
-    # --- 新增功能：汇率录入区 ---
-    # 检查当前用户拥有的资产涉及哪些外币
-    # 注意：需确保 assets 表已有 currency 字段 (通过运行 update_schema_v2.py)
+    # --- 2. 汇率录入区 (保持不变) ---
     if 'currency' in assets.columns:
         unique_currencies = assets['currency'].unique().tolist()
         foreign_currencies = [c for c in unique_currencies if c and c != 'CNY']
@@ -549,191 +555,194 @@ def page_data_entry():
     if foreign_currencies:
         with st.expander(f"💱 设置当日汇率 ({str_date})", expanded=True):
             st.caption("检测到您持有外币资产，请确认当日汇率（对人民币）：")
-            
-            # 获取数据库里已存的当日汇率
-            saved_rates = pd.read_sql(
-                "SELECT currency, rate FROM exchange_rates WHERE date = ?", 
-                conn, params=(str_date,)
-            )
+            saved_rates = pd.read_sql("SELECT currency, rate FROM exchange_rates WHERE date = ?", conn, params=(str_date,))
             saved_rate_map = dict(zip(saved_rates['currency'], saved_rates['rate']))
-            
-            # 动态生成输入框
             cols = st.columns(len(foreign_currencies) + 1)
             rates_to_save = {}
-            
             for i, curr in enumerate(foreign_currencies):
-                # 默认值逻辑：当日已存 > 1.0
                 default_val = saved_rate_map.get(curr, 1.0)
-                
                 with cols[i]:
-                    r = st.number_input(
-                        f"{curr} ➡️ CNY", 
-                        value=float(default_val), 
-                        format="%.4f", 
-                        key=f"rate_{curr}_{str_date}"  # <--- 这里改了
-                    )                    
+                    r = st.number_input(f"{curr} ➡️ CNY", value=float(default_val), format="%.4f", key=f"rate_{curr}_{str_date}")
                     rates_to_save[curr] = r
-            
             with cols[-1]:
-                st.write("") # 占位
-                st.write("") 
+                st.write(""); st.write("") 
                 if st.button("💾 保存汇率", type="secondary"):
                     try:
                         for curr, rate in rates_to_save.items():
-                            conn.execute(
-                                "INSERT OR REPLACE INTO exchange_rates (date, currency, rate) VALUES (?, ?, ?)",
-                                (str_date, curr, rate)
-                            )
+                            conn.execute("INSERT OR REPLACE INTO exchange_rates (date, currency, rate) VALUES (?, ?, ?)", (str_date, curr, rate))
                         conn.commit()
                         st.toast("汇率已更新", icon="💱")
-                    except Exception as e:
-                        st.error(f"汇率保存失败: {e}")
+                    except Exception as e: st.error(f"汇率保存失败: {e}")
 
-    # 2. 筛选与排序区域
+    # --- 3. 筛选与排序工具 (升级版) ---
     with st.expander("🔍 筛选与排序工具", expanded=True):
-        # 第一行：筛选条件
+        # 第一行：核心筛选
         c1, c2, c3 = st.columns([2, 1, 2])
         with c1:
             kw = st.text_input("关键字搜索", placeholder="名称/代码")
         with c2:
+            # 🔥 新增：隐藏已清仓开关 (默认开启)
+            hide_cleared = st.checkbox("🙈 隐藏已清仓资产", value=True, help="勾选后，上次记录为【已清仓】的资产将不会显示在下方")
+        with c3:
             all_groups = pd.read_sql("SELECT DISTINCT tag_group FROM tags WHERE user_id = ?", conn, params=(user_id,))
             grp_list = ["(不筛选)"] + all_groups['tag_group'].tolist()
             sel_group = st.selectbox("标签组", grp_list)
-        with c3:
+            
+        # 第二行：标签细分与排序
+        s1, s2 = st.columns([2, 2])
+        with s1:
             sel_tags = []
             if sel_group != "(不筛选)":
                 t_df = pd.read_sql("SELECT tag_name FROM tags WHERE user_id=? AND tag_group=?", conn, params=(user_id, sel_group))
                 opts = ["【无此标签】"] + t_df['tag_name'].tolist()
                 sel_tags = st.multiselect("标签名", opts)
-
-        # 第二行：排序条件
-        st.divider()
-        s1, s2 = st.columns([1, 3])
-        with s1:
-            st.caption("设置列表排序方式：")
         with s2:
-            sort_option = st.radio(
-                "排序依据", 
-                ["默认 (ID)", "💰 总金额 (高→低)", "💰 总金额 (低→高)", 
-                 "📈 持有收益 (高→低)", "📉 持有收益 (低→高)", 
-                 "🚀 收益率 (高→低)", "🥀 收益率 (低→高)"],
-                horizontal=True
-            )
+            sort_option = st.radio("排序依据", ["默认 (ID)", "💰 总金额 (高→低)", "💰 总金额 (低→高)", "📈 持有收益 (高→低)"], horizontal=True)
 
-    # 3. 执行筛选
-    filtered_ids = set(assets['asset_id'].tolist())
+    # --- 4. 数据预处理：获取“清仓状态” ---
+    # 我们需要知道每个资产“最近一次”的状态是什么
+    # 使用 SQL 窗口函数或分组取最大日期来获取每个资产最新的 is_cleared 状态
+    # 这里的逻辑是：不管你选哪天录入，我们都参考该资产“也就是数据库里最新的一条记录”的状态
     
-    # A. 关键字
+    # 先把资产ID列表拿出来
+    all_asset_ids = tuple(assets['asset_id'].tolist())
+    if len(all_asset_ids) == 1: str_ids = f"({all_asset_ids[0]})"
+    else: str_ids = str(all_asset_ids)
+    
+    # 查出每个资产最近一次快照的 is_cleared 状态
+    # 注意：我们要查的是“历史记录”，所以不限制日期，直接找最新的
+    last_status_df = pd.read_sql(f'''
+        SELECT asset_id, is_cleared 
+        FROM snapshots 
+        WHERE asset_id IN {str_ids}
+        ORDER BY date DESC
+    ''', conn)
+    # 去重保留每个 asset_id 的第一条（也就是最新的）
+    last_status_df = last_status_df.drop_duplicates(subset=['asset_id'])
+    
+    # 将最新状态合并回 assets 表
+    assets = pd.merge(assets, last_status_df, on='asset_id', how='left')
+    # 如果以前没记录，默认为 0 (未清仓)
+    assets['is_cleared'] = assets['is_cleared'].fillna(0).astype(bool)
+
+    # --- 5. 执行筛选 ---
+    filtered_df = assets.copy()
+    
+    # A. 隐藏已清仓逻辑 (核心功能)
+    if hide_cleared:
+        # 只保留 is_cleared == False 的 (即未清仓的)
+        filtered_df = filtered_df[filtered_df['is_cleared'] == False]
+    
+    # B. 关键字
     if kw:
-        matched = assets[assets['name'].str.contains(kw, case=False) | assets['code'].str.contains(kw, case=False, na=False)]
-        filtered_ids = filtered_ids.intersection(set(matched['asset_id']))
+        filtered_df = filtered_df[filtered_df['name'].str.contains(kw, case=False) | filtered_df['code'].str.contains(kw, case=False, na=False)]
     
-    # B. 标签
+    # C. 标签 (逻辑不变)
     if sel_group != "(不筛选)" and sel_tags:
-        sql_labeled = '''
-            SELECT atm.asset_id, t.tag_name 
-            FROM asset_tag_map atm JOIN tags t ON atm.tag_id = t.tag_id 
-            WHERE t.user_id = ? AND t.tag_group = ?
-        '''
+        sql_labeled = '''SELECT atm.asset_id, t.tag_name FROM asset_tag_map atm JOIN tags t ON atm.tag_id = t.tag_id WHERE t.user_id = ? AND t.tag_group = ?'''
         df_labeled = pd.read_sql(sql_labeled, conn, params=(user_id, sel_group))
-        
-        target_group_ids = set()
-        if "【无此标签】" in sel_tags:
-            target_group_ids.update(filtered_ids - set(df_labeled['asset_id']))
-        
+        target_ids = set()
+        current_ids = set(filtered_df['asset_id'])
+        if "【无此标签】" in sel_tags: target_ids.update(current_ids - set(df_labeled['asset_id']))
         real_tags = [t for t in sel_tags if t != "【无此标签】"]
-        if real_tags:
-            target_group_ids.update(set(df_labeled[df_labeled['tag_name'].isin(real_tags)]['asset_id']))
-            
-        filtered_ids = filtered_ids.intersection(target_group_ids)
+        if real_tags: target_ids.update(set(df_labeled[df_labeled['tag_name'].isin(real_tags)]['asset_id']))
+        filtered_df = filtered_df[filtered_df['asset_id'].isin(target_ids)]
 
-    # 4. 获取数据并合并
-    final_df = assets[assets['asset_id'].isin(filtered_ids)].copy()
-    
-    if final_df.empty:
-        st.info("没有符合条件的资产。")
+    # --- 6. 准备编辑表格 ---
+    if filtered_df.empty:
+        st.info("没有符合条件的资产 (可能都被隐藏了，尝试取消勾选'隐藏已清仓')。")
     else:
-        # 获取快照
-        ids_tuple = tuple(final_df['asset_id'].tolist())
-        if len(ids_tuple) == 1:
-            query_str = f"({ids_tuple[0]})"
-        else:
-            query_str = str(ids_tuple)
-            
-        snap_query = f'''SELECT asset_id, amount, profit, cost, yield_rate 
-                         FROM snapshots WHERE date = ? AND asset_id IN {query_str}'''
+        final_ids = tuple(filtered_df['asset_id'].tolist())
+        if len(final_ids) == 1: q_ids = f"({final_ids[0]})"
+        else: q_ids = str(final_ids)
         
-        snapshots = pd.read_sql(snap_query, conn, params=(str_date,))
-        merged = pd.merge(final_df, snapshots, on='asset_id', how='left')
+        # 获取【选中日期】的快照数据
+        # 注意：这里我们还要取 is_cleared，以便回显当天的数据
+        snap_query = f'''SELECT asset_id, amount, profit, cost, yield_rate, is_cleared 
+                         FROM snapshots WHERE date = ? AND asset_id IN {q_ids}'''
         
-        # 填充空值 (保证排序时不报错)
+        current_snapshots = pd.read_sql(snap_query, conn, params=(str_date,))
+        
+        # 合并：资产基础信息 + 当日快照信息
+        # 注意：这里有两个 is_cleared。
+        # assets 表里的 is_cleared 是“历史最新状态”(用于筛选)，
+        # current_snapshots 表里的 is_cleared 是“当天已保存的状态”(用于编辑)。
+        # 我们优先使用“当天已保存的状态”，如果当天还没存，默认使用“历史最新状态”来填充（这就是所谓的继承！）
+        
+        merged = pd.merge(filtered_df, current_snapshots, on='asset_id', how='left', suffixes=('_last', '_today'))
+        
+        # 填充数值
         merged['amount'] = merged['amount'].fillna(0.0)
         merged['profit'] = merged['profit'].fillna(0.0)
         merged['yield_rate'] = merged['yield_rate'].fillna(0.0)
-
-        # --- 5. 执行排序 ---
-        if "总金额 (高→低)" in sort_option:
-            merged = merged.sort_values(by='amount', ascending=False)
-        elif "总金额 (低→高)" in sort_option:
-            merged = merged.sort_values(by='amount', ascending=True)
-        elif "持有收益 (高→低)" in sort_option:
-            merged = merged.sort_values(by='profit', ascending=False)
-        elif "持有收益 (低→高)" in sort_option:
-            merged = merged.sort_values(by='profit', ascending=True)
-        elif "收益率 (高→低)" in sort_option:
-            merged = merged.sort_values(by='yield_rate', ascending=False)
-        elif "收益率 (低→高)" in sort_option:
-            merged = merged.sort_values(by='yield_rate', ascending=True)
         
-        # --- 6. 显示表格 ---
-        st.caption(f"当前显示: {len(merged)} 条 | 💡 请直接录入 **原币种** 金额 (例如美元资产直接填 USD 金额)")
+        # 核心继承逻辑：
+        # 如果 _today 是 NaN (说明今天还没填)，就用 _last (上次的状态)
+        # 如果 _today 有值，就用 _today
+        merged['is_cleared'] = merged['is_cleared_today'].combine_first(merged['is_cleared_last'])
+        # 确保是布尔值
+        merged['is_cleared'] = merged['is_cleared'].astype(bool)
 
-        # 检查是否包含 currency 列，防止旧数据库报错
+        # 排序
+        if "总金额 (高→低)" in sort_option: merged = merged.sort_values(by='amount', ascending=False)
+        elif "总金额 (低→高)" in sort_option: merged = merged.sort_values(by='amount', ascending=True)
+        elif "持有收益 (高→低)" in sort_option: merged = merged.sort_values(by='profit', ascending=False)
+        
+        # --- 7. 显示表格 ---
+        st.caption(f"当前显示: {len(merged)} 条 | 💡 勾选【🏁】列表示已清仓，下次录入时会自动隐藏")
+
         col_cfg = {
             "asset_id": st.column_config.NumberColumn("ID", disabled=True, width="small"),
             "name": st.column_config.TextColumn("资产名称", disabled=True),
             "code": st.column_config.TextColumn("代码", disabled=True),
-            "amount": st.column_config.NumberColumn("💰 总市值 (原币)", format="%.2f", required=True),
-            "profit": st.column_config.NumberColumn("📈 持有收益 (原币)", format="%.2f", required=True),
+            "amount": st.column_config.NumberColumn("💰 市值 (原币)", format="%.2f", required=True),
+            "profit": st.column_config.NumberColumn("📈 收益 (原币)", format="%.2f", required=True),
             "cost": st.column_config.NumberColumn("本金", disabled=True, format="%.2f"),
             "yield_rate": st.column_config.NumberColumn("收益率", disabled=True, format="%.2f%%"),
+            # 🔥 新增列配置
+            "is_cleared": st.column_config.CheckboxColumn("🏁 清仓?", help="勾选后表示该资产已清仓"),
         }
-        
-        # 如果有 currency 字段，配置它
         if 'currency' in merged.columns:
-            col_cfg["currency"] = st.column_config.TextColumn("币种", disabled=True, width="small")
+            col_cfg["currency"] = st.column_config.TextColumn("币", disabled=True, width="small")
 
         edited_snapshot = st.data_editor(
             merged,
             column_config=col_cfg,
             hide_index=True,
             use_container_width=True,
-            # Key 加入 sort_option 等变量，保证状态刷新
-            key=f"entry_{len(merged)}_{kw}_{sel_group}_{sort_option}_{str_date}"
+            # 这里的 key 很重要，加上 hide_cleared 状态，确保切换筛选时表格重绘
+            key=f"entry_{str_date}_{kw}_{hide_cleared}_{sort_option}"
         )
 
-        # --- 7. 保存逻辑 ---
+        # --- 8. 保存逻辑 ---
         if st.button("💾 保存当前数据", type="primary"):
             try:
                 c = 0
                 for _, row in edited_snapshot.iterrows():
                     amt = float(row['amount'])
                     prof = float(row['profit'])
-                    # 自动计算 Cost
+                    # 如果用户勾选了清仓，通常金额应该是0，但我们不强制改写，保留用户输入
+                    is_clr = 1 if row['is_cleared'] else 0
+                    
                     cost = amt - prof
-                    # 自动计算 Yield Rate
                     y_rate = (prof / cost * 100) if cost != 0 else 0.0
                     
+                    # 插入或更新，包含 is_cleared
                     conn.execute('''
-                        INSERT INTO snapshots (asset_id, date, amount, profit, cost, yield_rate) 
-                        VALUES (?, ?, ?, ?, ?, ?)
+                        INSERT INTO snapshots (asset_id, date, amount, profit, cost, yield_rate, is_cleared) 
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(asset_id, date) DO UPDATE SET 
                         amount=excluded.amount, profit=excluded.profit, 
-                        cost=excluded.cost, yield_rate=excluded.yield_rate
-                    ''', (row['asset_id'], str_date, amt, prof, cost, y_rate))
+                        cost=excluded.cost, yield_rate=excluded.yield_rate,
+                        is_cleared=excluded.is_cleared
+                    ''', (row['asset_id'], str_date, amt, prof, cost, y_rate, is_clr))
                     c += 1
                 conn.commit()
                 st.success(f"已保存 {c} 条记录！")
+                # 稍微延迟一下自动刷新，让用户看到成功提示
+                import time
+                time.sleep(0.5)
+                st.rerun()
             except Exception as e:
                 st.error(f"保存失败: {e}")
 
@@ -863,6 +872,58 @@ def page_dashboard():
     if df_assets is None or df_assets.empty:
         st.info("👋 暂无数据，请先前往【数据录入】页面添加资产快照。")
         return
+
+# === 🔥 新增：AI 投顾入口 ===
+    with st.expander("🤖 AI 智能投顾 (离线版)", expanded=False):
+        c_ai_1, c_ai_2 = st.columns([3, 1])
+        with c_ai_1:
+            st.markdown("""
+            **功能说明**：系统将基于您的资产数据（总值、回撤、持仓结构），自动生成一份专业的 **Prompt (提示词)** 并发送到您的邮箱。
+            全程不连接外部 AI 接口，数据安全由您掌控。
+            """)
+            
+            # --- 控件区 ---
+            ac1, ac2 = st.columns(2)
+            
+            with ac1:
+                # 1. 日期选择器 (从现有数据中提取日期)
+                valid_dates = sorted(df_assets['date'].unique(), reverse=True)
+                selected_ai_date = st.selectbox(
+                    "📅 选择复盘日期",
+                    options=valid_dates,
+                    format_func=lambda x: x.strftime('%Y-%m-%d'),
+                    help="选择您想要 AI 进行分析的历史时间点"
+                )
+                str_ai_date = selected_ai_date.strftime('%Y-%m-%d')
+            
+            with ac2:
+                # 2. 维度选择器
+                ai_tag_groups = []
+                if df_tags is not None and not df_tags.empty:
+                    ai_tag_groups = df_tags['tag_group'].unique().tolist()
+                
+                if not ai_tag_groups:
+                    selected_ai_group = "默认"
+                else:
+                    selected_ai_group = st.selectbox(
+                        "📊 选择分析维度", 
+                        options=ai_tag_groups,
+                        index=0
+                    )
+
+        with c_ai_2:
+            st.write("") # 占位
+            st.write("") 
+            # 按钮
+            if st.button("📧 生成并发送 Prompt", type="primary", use_container_width=True, disabled=(not ai_tag_groups)):
+                with st.spinner(f"正在分析 {str_ai_date} 的数据..."):
+                    # 🔥 传入日期和组别
+                    success, msg = generate_and_send_ai_prompt(user_id, selected_ai_group, str_ai_date)
+                    if success:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
+    st.divider()
 
     # 全局日期范围
     min_date = df_assets['date'].min().date()
@@ -1834,17 +1895,14 @@ def page_investment_notes():
     conn.close()
 
 def page_fire_projection():
-    st.header("🔥 FIRE 财富自由展望")
-    st.caption("推演未来 50 年的资产复利增长，看看你在多少岁能实现财务自由。")
+    st.header("🔥 FIRE 财富自由展望 2.0")
+    st.caption("引入通胀调节与风险区间，还原最真实的财富自由之路。")
     
     user_id = st.session_state.user['user_id']
     conn = get_db_connection()
     
-    # --- 1. 获取当前总资产 (起点) - 多币种修正版 ---
-    # A. 获取最新汇率
+    # --- 1. 获取当前总资产 (起点) ---
     rates_map = get_latest_rates(conn)
-    
-    # B. 获取最新一天的快照数据 (带币种)
     latest_date_row = conn.execute('SELECT MAX(date) as d FROM snapshots JOIN assets ON snapshots.asset_id = assets.asset_id WHERE assets.user_id = ?', (user_id,)).fetchone()
     
     current_total_assets_cny = 0.0
@@ -1852,7 +1910,6 @@ def page_fire_projection():
     
     if latest_date_row and latest_date_row['d']:
         latest_date = latest_date_row['d']
-        # 查出每个资产的原币种金额和币种类型
         rows = conn.execute('''
             SELECT s.amount, a.currency
             FROM snapshots s
@@ -1860,205 +1917,188 @@ def page_fire_projection():
             WHERE a.user_id = ? AND s.date = ?
         ''', (user_id, latest_date)).fetchall()
         
-        # C. 逐个折算并累加
         for row in rows:
             amt = row['amount']
             curr = row['currency']
-            # 如果是 CNY 则汇率为 1，否则查表，查不到默认为 1
             rate = 1.0 if curr == 'CNY' else rates_map.get(curr, 1.0)
             current_total_assets_cny += amt * rate
             
     conn.close()
 
     # --- 2. 参数设置区域 ---
-    with st.container():
-        c1, c2, c3, c4 = st.columns(4)
+    with st.expander("🛠️ 核心参数设定", expanded=True):
+        c1, c2, c3 = st.columns(3)
         with c1:
-            # 修改点：单位改为万元，默认值除以10000
-            base_amount_wan = st.number_input(
-                "当前总资产 (折合人民币/万元)", 
-                value=float(current_total_assets_cny) / 10000.0, 
-                step=1.0, 
-                format="%.2f"
-            )
-            base_amount = base_amount_wan * 10000 # 换算回元参与核心计算
+            base_amount_wan = st.number_input("当前总资产 (万 CNY)", value=float(current_total_assets_cny) / 10000.0, step=1.0, format="%.2f")
+            base_amount = base_amount_wan * 10000
             
+            annual_addition_wan = st.number_input("每年定投/追加 (万)", value=20.0, step=1.0)
+            annual_addition = annual_addition_wan * 10000
+
         with c2:
-            current_age = st.number_input("当前年龄 (岁)", value=28, step=1, format="%d")
+            current_age = st.number_input("当前年龄", value=28, step=1)
+            
+            annual_rate = st.number_input("预期年化收益率 (%)", value=8.0, step=0.5, help="长期来看，标普500约 8-10%")
+            
+            # 🔥 这里把 max_value 限制得小一点，防止用户填太夸张的数字
+            volatility = st.slider("长期收益波动 (±%)", min_value=0.0, max_value=4.0, value=1.5, step=0.5, 
+                                 help="这是对【长期平均年化收益】的敏感度测试。例如填 1.5%，表示测试 6.5% ~ 9.5% 的区间。")
+
         with c3:
-            annual_rate = st.number_input("预期年化收益率 (%)", value=8.0, step=0.5)
-        with c4:
-            # 单位：万元
-            annual_addition_wan = st.number_input("每年追加本金 (万元)", value=12.0, step=1.0, help="假设每年工资结余用于投资的金额")
-            annual_addition = annual_addition_wan * 10000 # 换算回元参与核心计算
+            inflation_rate = st.number_input("预估通胀率 (%)", value=3.0, step=0.1)
+            target_monthly_expense = st.number_input("理想月生活费 (元)", value=10000, step=1000)
 
     st.divider()
 
-    # --- 3. 复利推演计算 ---
-    years_to_project = 50
+    # --- 3. 4% 法则仪表盘 ---
+    safe_withdrawal_rate = 0.04
+    monthly_passive_income = (base_amount * safe_withdrawal_rate) / 12
+    coverage_ratio = (monthly_passive_income / target_monthly_expense) * 100
+    fire_number = (target_monthly_expense * 12) / safe_withdrawal_rate
+    
+    kpi1, kpi2, kpi3 = st.columns(3)
+    with kpi1:
+        st.metric("当前每月被动收入 (4%)", f"¥{monthly_passive_income:,.0f}", help="按4%法则提取的月安全收入")
+    with kpi2:
+        st.metric("生活费覆盖率", f"{coverage_ratio:.1f}%", delta=f"差 {100-coverage_ratio:.1f}%" if coverage_ratio < 100 else "已达成！", delta_color="normal" if coverage_ratio < 100 else "inverse")
+        st.progress(min(1.0, coverage_ratio / 100))
+    with kpi3:
+        st.metric("FIRE 目标金额", f"¥{fire_number/10000:.0f}万", delta=f"当前: {base_amount/10000:.0f}万")
+
+    st.divider()
+
+    # --- 4. 复利与风险推演计算 ---
+    years_to_project = 40
     projection_data = []
     
-    current_balance = base_amount
-    cumulative_principal = base_amount 
-    cumulative_profit = 0.0
+    curr_bal = base_amount
+    curr_bal_opt = base_amount 
+    curr_bal_pess = base_amount 
+    curr_principal = base_amount
     
-    # 关键里程碑 (万)
-    milestones = [100, 300, 500, 1000, 2000, 3000, 5000, 10000] 
-    achieved_milestones = set()
-    milestone_events = [] 
-
-    # 第0年（现在）
     projection_data.append({
-        "year": start_year,
-        "age": current_age,
-        "balance": current_balance,
-        "principal": cumulative_principal,
-        "profit": 0.0
+        "year": start_year, "age": current_age,
+        "balance": curr_bal, "balance_real": curr_bal,
+        "balance_opt": curr_bal_opt, "balance_pess": curr_bal_pess,
+        "principal": curr_principal
     })
-    
-    # 检查起步是否已经达成某些成就
-    for m in milestones:
-        if current_balance >= m * 10000:
-            achieved_milestones.add(m)
 
     for i in range(1, years_to_project + 1):
-        # 核心复利公式
-        current_balance = current_balance * (1 + annual_rate / 100.0) + annual_addition
-        cumulative_principal += annual_addition
-        cumulative_profit = current_balance - cumulative_principal # 计算累计收益
-        
-        this_year = start_year + i
-        this_age = current_age + i
+        curr_bal = curr_bal * (1 + annual_rate / 100.0) + annual_addition
+        curr_bal_opt = curr_bal_opt * (1 + (annual_rate + volatility) / 100.0) + annual_addition
+        curr_bal_pess = curr_bal_pess * (1 + (annual_rate - volatility) / 100.0) + annual_addition
+        curr_principal += annual_addition
+        real_purchasing_power = curr_bal / ((1 + inflation_rate / 100.0) ** i)
         
         projection_data.append({
-            "year": this_year,
-            "age": this_age,
-            "balance": current_balance,
-            "principal": cumulative_principal,
-            "profit": cumulative_profit
+            "year": start_year + i, "age": current_age + i,
+            "balance": curr_bal, "balance_real": real_purchasing_power,
+            "balance_opt": curr_bal_opt, "balance_pess": curr_bal_pess,
+            "principal": curr_principal
         })
-        
-        # 检查里程碑
-        for m in milestones:
-            if m not in achieved_milestones and current_balance >= m * 10000:
-                achieved_milestones.add(m)
-                milestone_events.append({
-                    "year": this_year,
-                    "age": this_age, # 记录达成年龄
-                    "amount": current_balance,
-                    "milestone": m,
-                    "text": f"🚩 {this_age}岁: 破 {m} 万" 
-                })
 
     df_proj = pd.DataFrame(projection_data)
-    # 单位换算为万 (用于绘图)
-    df_proj['balance_w'] = df_proj['balance'] / 10000
-    df_proj['principal_w'] = df_proj['principal'] / 10000
-    df_proj['profit_w'] = df_proj['profit'] / 10000
+    cols_to_convert = ['balance', 'balance_real', 'balance_opt', 'balance_pess', 'principal']
+    for c in cols_to_convert: df_proj[f'{c}_w'] = df_proj[c] / 10000
 
-    # --- 4. 绘图 (Plotly Graph Objects) ---
+    # --- 5. 绘图 (Plotly) - 🔥 核心美化部分 ---
+    st.subheader("📈 资产推演：名义 vs 真实 vs 风险区间")
+    
     fig = go.Figure()
 
-    # A. 总资产曲线 (红色实线，最粗)
+    # A. 乐观预测 (区间上沿) - 透明线，主要为了Tooltip
     fig.add_trace(go.Scatter(
-        x=df_proj['year'], 
-        y=df_proj['balance_w'],
+        x=df_proj['age'], y=df_proj['balance_opt_w'],
         mode='lines',
-        name='总资产 (复利)',
-        line=dict(color='#E74C3C', width=4),
-        hovertemplate='<b>总资产</b>: %{y:.0f}万<extra></extra>'
-    ))
-    
-    # B. 累计收益曲线 (绿色实线)
-    fig.add_trace(go.Scatter(
-        x=df_proj['year'], 
-        y=df_proj['profit_w'],
-        mode='lines',
-        name='累计复利收益',
-        line=dict(color='#2ECC71', width=2),
-        hovertemplate='<b>累计收益</b>: %{y:.0f}万<extra></extra>'
+        line=dict(width=0),
+        name='乐观预测',
+        showlegend=False,
+        customdata=df_proj['year'], # 传入年份供tooltip使用
+        hovertemplate=f'<b>🦄 乐观剧本 (+{volatility}%)</b><br>年份: %{{customdata}}<br>资产: <b>%{{y:.0f}}万</b><extra></extra>'
     ))
 
-    # C. 投入本金曲线 (灰色虚线)
+    # B. 悲观预测 (区间下沿 + 填充)
     fig.add_trace(go.Scatter(
-        x=df_proj['year'], 
-        y=df_proj['principal_w'],
+        x=df_proj['age'], y=df_proj['balance_pess_w'],
+        mode='lines',
+        line=dict(width=0),
+        fill='tonexty', # 填充到上一条线(乐观线)
+        fillcolor='rgba(46, 134, 193, 0.15)', # 更淡一点的蓝色
+        name=f'波动区间 (±{volatility}%)',
+        customdata=df_proj['year'],
+        hovertemplate=f'<b>🐢 悲观剧本 (-{volatility}%)</b><br>年份: %{{customdata}}<br>资产: <b>%{{y:.0f}}万</b><extra></extra>'
+    ))
+
+    # C. 名义总资产 (中轴线)
+    fig.add_trace(go.Scatter(
+        x=df_proj['age'], y=df_proj['balance_w'],
+        mode='lines',
+        name='名义预期 (中性)',
+        line=dict(color='#2E86C1', width=3),
+        customdata=df_proj['year'],
+        hovertemplate='<b>⚖️ 名义预期</b><br>年份: %{customdata}<br>资产: <b>%{y:.0f}万</b><extra></extra>'
+    ))
+
+    # D. 真实购买力
+    fig.add_trace(go.Scatter(
+        x=df_proj['age'], y=df_proj['balance_real_w'],
+        mode='lines',
+        name='真实购买力 (剔除通胀)',
+        line=dict(color='#E74C3C', width=3, dash='dash'),
+        customdata=df_proj['year'],
+        hovertemplate='<b>🍔 真实购买力</b><br>年份: %{customdata}<br>折合现值: <b>%{y:.0f}万</b><extra></extra>'
+    ))
+
+    # E. 投入本金
+    fig.add_trace(go.Scatter(
+        x=df_proj['age'], y=df_proj['principal_w'],
         mode='lines',
         name='投入本金',
         line=dict(color='#95A5A6', width=2, dash='dot'),
-        hovertemplate='<b>投入本金</b>: %{y:.0f}万<extra></extra>'
+        customdata=df_proj['year'],
+        hovertemplate='🌱 累计本金: %{y:.0f}万<extra></extra>'
     ))
 
-    # D. 添加里程碑标记
-    for event in milestone_events:
-        fig.add_annotation(
-            x=event['year'],
-            y=event['amount'] / 10000,
-            text=event['text'],
-            showarrow=True,
-            arrowhead=2,
-            arrowsize=1,
-            arrowwidth=2,
-            arrowcolor="#F39C12", 
-            ax=0,
-            ay=-40,
-            font=dict(size=11, color="#D35400", family="Arial Black"),
-            bgcolor="rgba(255, 255, 255, 0.7)",
-            bordercolor="#F39C12",
-            borderwidth=1
-        )
-
     fig.update_layout(
-        title="未来 50 年资产增长趋势 (单位: 万 CNY)",
-        xaxis_title="年份",
-        yaxis_title="金额 (万)",
+        xaxis_title="年龄", yaxis_title="金额 (万)",
         hovermode="x unified",
         legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01),
-        height=600 
+        height=550
     )
-
     st.plotly_chart(fig, use_container_width=True)
 
-    # --- 5. 总结文字 ---
-    if not df_proj.empty:
-        # 找几个关键节点
-        p10 = df_proj.iloc[10]
-        p20 = df_proj.iloc[20]
-        p30 = df_proj.iloc[30]
-        
-        # 计算“收益超过本金”的年份
-        cross_point = df_proj[df_proj['profit'] > df_proj['principal']].head(1)
-        cross_text = ""
-        if not cross_point.empty:
-            cp = cross_point.iloc[0]
-            cross_text = f"🚀 **神奇时刻**：在 **{cp['age']}岁 ({cp['year']}年)**，你的累计复利收益（{cp['profit_w']:.0f}万）将首次超过你的累计投入本金！从这一天起，钱为你打工的效率超过了你为钱打工。"
+    # --- 6. 关键数据解读 ---
+    real_break_even = df_proj[df_proj['balance_real'] > df_proj['principal']].head(1)
+    target_year_20 = df_proj.iloc[20]
 
-        st.markdown(f"""
-        ### 💡 人生财富剧本
-        假设你从 **{current_age}岁** 开始，现有 **{base_amount_wan:.2f}万 (CNY)**，保持 **{annual_rate}%** 的年化收益，每年坚持定投 **{annual_addition_wan:.1f}万**：
-        
-        * **{p10['age']}岁 ({p10['year']}年)**：资产达到 **{p10['balance_w']:.0f}万**（本金 {p10['principal_w']:.0f}万 + 收益 {p10['profit_w']:.0f}万）。
-        * **{p20['age']}岁 ({p20['year']}年)**：资产达到 **{p20['balance_w']:.0f}万**。
-        * **{p30['age']}岁 ({p30['year']}年)**：资产达到 **{p30['balance_w']:.0f}万**。
-        
-        {cross_text}
-        """)
+    st.info(f"""
+    **💡 深度解读：**
+    
+    * **风险区间的意义**：如果未来20年市场表现比预期好 **{volatility}%**（即年化 {annual_rate+volatility}%），你将拥有 **{target_year_20['balance_opt_w']:.0f}万**。
+    * **悲观底线**：如果市场表现比预期差 **{volatility}%**（即年化 {annual_rate-volatility}%），你仍将拥有 **{target_year_20['balance_pess_w']:.0f}万**。
+    * **购买力警告**：20年后账面上的 **{target_year_20['balance_w']:.0f}万**，在超市里只能买到相当于今天 **{target_year_20['balance_real_w']:.0f}万** 的东西。
+    """, icon="🧐")
 
-    # --- 6. 详细数据表 (含年龄列) ---
-    with st.expander("查看详细年份数据"):
+    # --- 7. 数据表 ---
+    with st.expander("查看详细推演数据"):
         st.dataframe(
-            df_proj[['year', 'age', 'balance', 'principal', 'profit']],
+            df_proj[['age', 'year', 'balance_w', 'balance_real_w', 'balance_pess_w', 'balance_opt_w', 'principal_w']],
             column_config={
-                "year": st.column_config.NumberColumn("年份", format="%d"),
-                "age": st.column_config.NumberColumn("年龄", format="%d岁"),
-                "balance": st.column_config.NumberColumn("预估总资产", format="¥%.2f"),
-                "principal": st.column_config.NumberColumn("累计本金", format="¥%.2f"),
-                "profit": st.column_config.NumberColumn("累计收益", format="¥%.2f"),
+                "age": "年龄",
+                "year": "年份",
+                "balance_w": st.column_config.NumberColumn("名义资产 (万)", format="%.0f"),
+                "balance_real_w": st.column_config.NumberColumn("真实购买力 (万)", format="%.0f"),
+                # 👇 新增下面这两行 👇
+                "balance_pess_w": st.column_config.NumberColumn("悲观底线 (万)", format="%.0f"),
+                "balance_opt_w": st.column_config.NumberColumn("乐观预测 (万)", format="%.0f"),
+                # 👆 新增上面这两行 👆
+                "principal_w": st.column_config.NumberColumn("累计本金 (万)", format="%.0f"),
             },
             hide_index=True,
             use_container_width=True
         )
 
+  
 # --- 备份核心逻辑 ---
 def send_email_backup(filepath, settings):
     """发送带有数据库附件的邮件 (修复 SSL 关闭报错版)"""
@@ -2110,7 +2150,155 @@ def send_email_backup(filepath, settings):
 
     except Exception as e:
         return False, f"邮件准备失败: {str(e)}"
+
+def generate_and_send_ai_prompt(user_id, target_group, target_date_str):
+    """
+    生成 AI 顾问提示词并发送邮件 (支持指定日期 & 维度)
+    """
+    conn = get_db_connection()
     
+    # --- 1. 获取系统设置 ---
+    settings = conn.execute('SELECT * FROM system_settings WHERE id = 1').fetchone()
+    if not settings['email_host']:
+        conn.close()
+        return False, "未配置邮箱 SMTP，无法发送。"
+
+    # --- 2. 搜集核心数据 ---
+    df_assets, df_tags = process_analytics_data(conn, user_id)
+    
+    if df_assets is None or df_assets.empty:
+        conn.close()
+        return False, "暂无资产数据，无法生成分析。"
+
+    # 转换日期格式以便比较
+    # 确保 target_date_str 是 YYYY-MM-DD 格式，df 中的 date 是 datetime
+    target_date = pd.to_datetime(target_date_str)
+
+    # A. 总体概况 (筛选指定日期)
+    daily_total = df_assets.groupby('date')[['amount', 'profit', 'cost']].sum().reset_index().sort_values('date')
+    
+    # 找到目标日期的那一行
+    target_row_df = daily_total[daily_total['date'] == target_date]
+    if target_row_df.empty:
+        conn.close()
+        return False, f"找不到日期 {target_date_str} 的资产数据。"
+    
+    target_row = target_row_df.iloc[0]
+    
+    # 环比数据 (和目标日期的 30 天前相比)
+    try:
+        month_ago_date = target_date - timedelta(days=30)
+        # 找一个离30天前最近的日期 (<= 30天前)
+        past_rows = daily_total[daily_total['date'] <= month_ago_date]
+        if not past_rows.empty:
+            month_ago_row = past_rows.iloc[-1]
+            month_change = target_row['amount'] - month_ago_row['amount']
+            month_change_pct = (month_change / month_ago_row['amount']) * 100
+        else:
+            month_change = 0
+            month_change_pct = 0
+    except:
+        month_change = 0
+        month_change_pct = 0
+
+    # B. 风险指标 (计算截止到目标日期的回撤)
+    # 只取截止到 target_date 的历史数据来算回撤
+    history_slice = daily_total[daily_total['date'] <= target_date].copy()
+    history_slice['rolling_max'] = history_slice['amount'].cummax()
+    history_slice['drawdown'] = (history_slice['amount'] - history_slice['rolling_max']) / history_slice['rolling_max']
+    
+    max_mdd = history_slice['drawdown'].min() * 100
+    current_dd = history_slice.iloc[-1]['drawdown'] * 100
+
+    # C. 持仓结构 (Top 5 资产 - 指定日期)
+    target_assets = df_assets[df_assets['date'] == target_date].copy()
+    target_assets = target_assets.sort_values('amount', ascending=False)
+    
+    top_5_str = ""
+    for i, row in target_assets.head(5).iterrows():
+        currency_info = f" ({row['currency']})" if 'currency' in row and row['currency'] != 'CNY' else ""
+        top_5_str += f"- {row['name']}{currency_info}: ¥{row['amount']:,.0f} (占比 {(row['amount']/target_row['amount']*100):.1f}%)\n"
+
+    # D. 标签分布 (指定日期 & 用户指定的 target_group)
+    alloc_str = ""
+    if df_tags is not None and not df_tags.empty:
+        target_tags = df_tags[df_tags['date'] == target_date]
+        
+        # 筛选指定标签组
+        group_data = target_tags[target_tags['tag_group'] == target_group].sort_values('amount', ascending=False)
+        
+        if group_data.empty:
+             alloc_str = "(该标签组下暂无数据)"
+        else:
+            for i, row in group_data.iterrows():
+                alloc_str += f"- {row['tag_name']}: {(row['amount']/target_row['amount']*100):.1f}%\n"
+    else:
+        alloc_str = "(暂无标签数据)"
+
+    conn.close()
+
+    # --- 3. 组装 Prompt 模板 ---
+    prompt_content = f"""
+===== 复制以下内容发送给 AI =====
+
+【角色设定】
+你是一位专业的私人财富管理顾问，擅长资产配置、风险控制和 FIRE (Financial Independence, Retire Early) 规划。你信奉长期主义，风格理性客观。
+
+【背景信息】
+我是一名 FIRE 追求者。
+**数据快照日期：{target_date_str}** (请基于该日期的历史状态进行复盘分析)
+
+以下是该日期的资产组合快照（已折算为人民币 CNY）：
+
+1. 核心数据：
+   - 当日总净值：¥{target_row['amount']:,.0f}
+   - 累计持有收益：¥{target_row['profit']:,.0f} (收益率 {(target_row['profit']/target_row['cost']*100 if target_row['cost']!=0 else 0):.2f}%)
+   - 近30天变动：¥{month_change:,.0f} ({month_change_pct:+.2f}%)
+   - 历史最大回撤：{max_mdd:.2f}% (截止当日)
+   - 当前回撤：{current_dd:.2f}%
+
+2. 前五大持仓 (集中度风险参考)：
+{top_5_str}
+3. 资产配置比例 (基于我的 "{target_group}" 分类)：
+{alloc_str}
+
+【分析任务】
+请基于以上数据，简明扼要地回答以下问题：
+
+1. **组合健康度诊断**：
+   - 我的资产配置（按 {target_group}）是否存在严重的结构性风险？
+   - 结合当时的回撤情况，我的风险控制是否在合理范围？
+
+2. **复盘分析**：
+   - 针对该节点前 30 天的资产变动，请尝试分析当时的潜在原因。
+
+3. **操作建议**：
+   - 如果我处于该时间节点，针对当时的持仓结构，有什么优化建议？
+
+请保持回答专业、客观，无需客套，直接输出分析结果。
+
+================================
+    """
+
+    # --- 4. 发送邮件 ---
+    try:
+        msg = MIMEMultipart()
+        msg['Subject'] = f'🤖 AI 投顾提示词 ({target_date_str}) - {datetime.now().strftime("%Y-%m-%d")}'
+        msg['From'] = settings['email_user']
+        msg['To'] = settings['email_to'] if settings['email_to'] else settings['email_user']
+        
+        body = "这是为您自动生成的 AI 复盘提示词。请复制下方的文本，发送给 ChatGPT / Claude / DeepSeek 进行分析。\n\n" + prompt_content
+        msg.attach(MIMEText(body, 'plain'))
+
+        server = smtplib.SMTP_SSL(settings['email_host'], settings['email_port'])
+        server.login(settings['email_user'], settings['email_password'])
+        server.send_message(msg)
+        server.quit()
+        
+        return True, f"已发送 {target_date_str} 的分析提示词至邮箱！"
+    except Exception as e:
+        return False, f"邮件发送失败: {str(e)}"
+  
 def perform_backup(manual=False):
     """执行备份：1.本地复制 2.发送邮件 3.更新时间"""
     conn = get_db_connection()

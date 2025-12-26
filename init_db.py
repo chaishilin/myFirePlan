@@ -3,17 +3,9 @@ import os
 
 DB_FILE = 'asset_tracker.db'
 
-def get_db_connection():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
 def init_db():
-    print(f"🚀 正在初始化数据库: {DB_FILE} ...")
-    
-    conn = get_db_connection()
+    conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("PRAGMA foreign_keys = ON;")
     
     # 1. 用户表
     cursor.execute('''
@@ -24,32 +16,34 @@ def init_db():
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
     ''')
-    
+
     # 2. 会话表
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS user_sessions (
-        token TEXT PRIMARY KEY,
+        session_id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        token TEXT UNIQUE NOT NULL,
         expires_at DATETIME NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (user_id) REFERENCES users (user_id)
     )
     ''')
-    
-    # 3. 资产表 (已新增 remarks 字段)
+
+    # 3. 资产表 (已更新: 增加 currency 和 remarks)
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS assets (
         asset_id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
         name TEXT NOT NULL,
         code TEXT,
-        type TEXT,
-        remarks TEXT,  -- 新增备注字段
+        type TEXT NOT NULL,
+        currency TEXT DEFAULT 'CNY',  -- 新增：币种
+        remarks TEXT,                 -- 新增：备注
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (user_id) REFERENCES users (user_id)
     )
     ''')
-    
+
     # 4. 标签表
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS tags (
@@ -62,19 +56,20 @@ def init_db():
         FOREIGN KEY (user_id) REFERENCES users (user_id)
     )
     ''')
-    
-    # 5. 映射表
+
+    # 5. 资产-标签关联表
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS asset_tag_map (
+        map_id INTEGER PRIMARY KEY AUTOINCREMENT,
         asset_id INTEGER NOT NULL,
         tag_id INTEGER NOT NULL,
-        PRIMARY KEY (asset_id, tag_id),
+        UNIQUE(asset_id, tag_id),
         FOREIGN KEY (asset_id) REFERENCES assets (asset_id),
         FOREIGN KEY (tag_id) REFERENCES tags (tag_id)
     )
     ''')
-    
-    # 6. 快照表
+
+    # 6. 快照表 (已更新: 增加 is_cleared)
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS snapshots (
         snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,13 +79,69 @@ def init_db():
         profit REAL NOT NULL,
         cost REAL NOT NULL,
         yield_rate REAL,
+        is_cleared INTEGER DEFAULT 0, -- 新增：是否清仓 (0=否, 1=是)
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(asset_id, date),
         FOREIGN KEY (asset_id) REFERENCES assets (asset_id)
     )
     ''')
     
-    # 7. 再平衡表
+    # 7. 投资笔记表
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS investment_notes (
+        note_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        content TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (user_id)
+    )
+    ''')
+
+    # 8. 系统设置表
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS system_settings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        backup_frequency TEXT DEFAULT '关闭',
+        last_backup_at TEXT,
+        email_host TEXT,
+        email_port INTEGER,
+        email_user TEXT,
+        email_password TEXT,
+        email_to TEXT
+    )
+    ''')
+    # 初始化默认设置
+    cursor.execute('INSERT OR IGNORE INTO system_settings (id, backup_frequency) VALUES (1, "关闭")')
+
+    # 9. 定投计划表
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS investment_plans (
+        plan_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        asset_id INTEGER NOT NULL,
+        amount REAL NOT NULL,
+        frequency TEXT NOT NULL,
+        execution_day INTEGER NOT NULL,
+        is_active INTEGER DEFAULT 1,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (user_id),
+        FOREIGN KEY (asset_id) REFERENCES assets (asset_id)
+    )
+    ''')
+
+    # 10. 汇率表 (新增)
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS exchange_rates (
+        date TEXT,
+        currency TEXT,
+        rate REAL,
+        PRIMARY KEY (date, currency)
+    )
+    ''')
+
+    # 11. 再平衡目标表 (新增)
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS rebalance_targets (
         target_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -105,40 +156,9 @@ def init_db():
     )
     ''')
 
-    # 8. 定投计划表 (新增)
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS investment_plans (
-        plan_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        asset_id INTEGER NOT NULL,
-        amount REAL NOT NULL,
-        frequency TEXT NOT NULL, 
-        execution_day INTEGER,
-        is_active BOOLEAN DEFAULT 1,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users (user_id),
-        FOREIGN KEY (asset_id) REFERENCES assets (asset_id)
-    )
-    ''')
-    print("✅ 定投计划表 (investment_plans) 就绪")
-
-    # 9. 投资笔记表 (新增)
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS investment_notes (
-        note_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        title TEXT NOT NULL,
-        content TEXT NOT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (user_id) REFERENCES users (user_id)
-    )
-    ''')
-    print("✅ 投资笔记表 (investment_notes) 就绪")
-    
     conn.commit()
     conn.close()
-    print("🎉 数据库初始化完成 (含备注字段)！")
+    print("✅ 数据库结构初始化完成 (含最新字段：is_cleared, currency, remarks 及汇率表)")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     init_db()

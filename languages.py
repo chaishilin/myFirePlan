@@ -311,6 +311,7 @@ TRANSLATIONS = {
         "nav_notes": "📒 投资笔记",
         "nav_assets": "🏦 资产管理",
         "nav_entry": "📝 数据录入",
+        "nav_rebalance": "⚖️投资再平衡",
         "nav_plans": "📅 定投计划",
         "nav_fire": "🔥 FIRE推演",
         "nav_settings": "⚙️ 系统设置",
