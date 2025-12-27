@@ -1,16 +1,17 @@
 import streamlit as st
 import sqlite3
-import pandas as pd
 from datetime import datetime
 import hashlib
 import os
 import shutil
 from pathlib import Path
+import re
+# ❌ 删除或注释掉这些行：
+import pandas as pd
 import plotly.express as px
 import numpy as np
-import re
-from datetime import timedelta
 import plotly.graph_objects as go
+from datetime import timedelta
 import uuid
 import smtplib
 from email.mime.text import MIMEText
@@ -28,8 +29,8 @@ else:
     
 # --- 兼容性修复 ---
 # 某些旧版库可能还在找 np.bool8，这里做一个简单的映射防止报错
-if not hasattr(np, 'bool8'):
-    np.bool8 = np.bool_
+#if not hasattr(np, 'bool8'):
+#    np.bool8 = np.bool_
 
 # --- 配置 ---
 st.set_page_config(
@@ -65,6 +66,7 @@ def save_changes_to_db(edited_df, original_df, table_name, id_col, user_id, fixe
     :param user_id: 当前用户ID
     :param fixed_cols: 需要在插入/更新时强制固定的列 (如 {'user_id': 1})
     """
+    import pandas as pd  # 👈 加上这句
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -223,6 +225,7 @@ def page_login():
                 st.error("用户名已存在")
 
 def page_assets_tags():
+    import pandas as pd  # 👈 加上这句
     st.header("资产与标签管理")
     user_id = st.session_state.user['user_id']
     conn = get_db_connection()
@@ -527,6 +530,7 @@ def page_assets_tags():
     conn.close()
 
 def page_data_entry():
+    import pandas as pd  # 👈 加上这句
     st.header("📝 每日资产快照录入")
     user_id = st.session_state.user['user_id']
     conn = get_db_connection()
@@ -746,9 +750,56 @@ def page_data_entry():
             except Exception as e:
                 st.error(f"保存失败: {e}")
 
+        # --- [插入位置开始] ---
+        st.write("")
+        st.write("")
+        st.divider()
+        
+        # 9. 删除/重置当日数据 (新增功能)
+        # 先检查一下当天有没有数据，有数据才显示删除按钮
+        # 这里的逻辑是：查询 user_id 下，日期为 str_date 的所有快照数量
+        exist_count = conn.execute('''
+            SELECT COUNT(*) FROM snapshots s
+            JOIN assets a ON s.asset_id = a.asset_id
+            WHERE s.date = ? AND a.user_id = ?
+        ''', (str_date, user_id)).fetchone()[0]
+
+        if exist_count > 0:
+            with st.expander(f"🗑️ 删除/重置 【{str_date}】 的数据", expanded=False):
+                st.warning(f"警告：检测到 {str_date} 已有 {exist_count} 条资产记录。")
+                st.info("如果你是不小心录错日期（例如把昨天的录成了今天），点击下方按钮可以彻底清除今日记录。清除后，看板将不会把今天算作 0，而是直接跳过今天。")
+                
+                # 双重确认按钮（防止误触）
+                col_del_1, col_del_2 = st.columns([1, 4])
+                with col_del_1:
+                    if st.button("🧨 确认彻底删除", type="primary", key="btn_delete_daily"):
+                        try:
+                            # 执行删除操作
+                            # 逻辑：删除 snapshots 表中，属于该用户且日期为选定日期的所有记录
+                            conn.execute('''
+                                DELETE FROM snapshots 
+                                WHERE date = ? 
+                                AND asset_id IN (SELECT asset_id FROM assets WHERE user_id = ?)
+                            ''', (str_date, user_id))
+                            
+                            conn.commit()
+                            st.success(f"已成功删除 {str_date} 的所有记录！")
+                            
+                            # 稍微停顿一下让用户看到提示，然后刷新页面
+                            import time
+                            time.sleep(1)
+                            st.rerun()
+                            
+                        except Exception as e:
+                            st.error(f"删除失败: {e}")
+        else:
+            # 如果当天没数据，显示一个灰色的提示
+            st.caption(f"📅 当前日期 {str_date} 暂无录入数据，无需删除。")
+        # --- [插入位置结束] ---
     conn.close()
 
 def get_latest_rates(conn):
+    import pandas as pd  # 👈 加上这句
     """获取系统中每种货币最新的汇率 (对CNY)"""
     # 按日期降序排，去重取第一个
     df = pd.read_sql("SELECT currency, rate, date FROM exchange_rates ORDER BY date DESC", conn)
@@ -759,6 +810,7 @@ def get_latest_rates(conn):
 
 # --- 辅助函数：核心数据处理逻辑 ---
 def process_analytics_data(conn, user_id):
+    import pandas as pd  # 👈 加上这句
     """
     提取快照数据，并根据当天的汇率将所有非CNY资产折算为CNY。
     """
@@ -861,6 +913,15 @@ def process_analytics_data(conn, user_id):
 
 # --- 新版看板页面 ---
 def page_dashboard():
+    # 👇 这里要加一大堆
+    import pandas as pd
+    import plotly.express as px
+    import plotly.graph_objects as go
+    import numpy as np
+    
+    # 补丁挪到这里
+    if not hasattr(np, 'bool8'):
+        np.bool8 = np.bool_
     st.header("📊 深度资产透视")
     user_id = st.session_state.user['user_id']
     conn = get_db_connection()
@@ -878,53 +939,53 @@ def page_dashboard():
         c_ai_1, c_ai_2 = st.columns([3, 1])
         with c_ai_1:
             st.markdown("""
-            **功能说明**：系统将基于您的资产数据（总值、回撤、持仓结构），自动生成一份专业的 **Prompt (提示词)** 并发送到您的邮箱。
-            全程不连接外部 AI 接口，数据安全由您掌控。
+            **功能说明**：选择一个 **复盘周期**，系统将计算该期间的资产变动、最大回撤和期末持仓结构，生成专业的提示词发送给您。
             """)
             
-            # --- 控件区 ---
             ac1, ac2 = st.columns(2)
             
+            # 获取数据中的最早和最晚日期
+            min_db_date = df_assets['date'].min().date()
+            max_db_date = df_assets['date'].max().date()
+            
             with ac1:
-                # 1. 日期选择器 (从现有数据中提取日期)
-                valid_dates = sorted(df_assets['date'].unique(), reverse=True)
-                selected_ai_date = st.selectbox(
-                    "📅 选择复盘日期",
-                    options=valid_dates,
-                    format_func=lambda x: x.strftime('%Y-%m-%d'),
-                    help="选择您想要 AI 进行分析的历史时间点"
+                # 🔥 改为日期范围选择器
+                ai_date_range = st.date_input(
+                    "📅 选择复盘周期 (开始 - 结束)",
+                    value=(min_db_date, max_db_date),
+                    min_value=min_db_date,
+                    max_value=max_db_date,
+                    help="请选择开始日期和结束日期"
                 )
-                str_ai_date = selected_ai_date.strftime('%Y-%m-%d')
             
             with ac2:
-                # 2. 维度选择器
                 ai_tag_groups = []
                 if df_tags is not None and not df_tags.empty:
                     ai_tag_groups = df_tags['tag_group'].unique().tolist()
                 
-                if not ai_tag_groups:
-                    selected_ai_group = "默认"
-                else:
-                    selected_ai_group = st.selectbox(
-                        "📊 选择分析维度", 
-                        options=ai_tag_groups,
-                        index=0
-                    )
+                selected_ai_group = st.selectbox("📊 分析维度", options=ai_tag_groups, index=0) if ai_tag_groups else "默认"
 
         with c_ai_2:
-            st.write("") # 占位
-            st.write("") 
-            # 按钮
-            if st.button("📧 生成并发送 Prompt", type="primary", use_container_width=True, disabled=(not ai_tag_groups)):
-                with st.spinner(f"正在分析 {str_ai_date} 的数据..."):
-                    # 🔥 传入日期和组别
-                    success, msg = generate_and_send_ai_prompt(user_id, selected_ai_group, str_ai_date)
-                    if success:
-                        st.success(msg)
-                    else:
-                        st.error(msg)
-    st.divider()
+            st.write(""); st.write("") 
+            # 检查是否选了两个日期
+            is_range_valid = isinstance(ai_date_range, tuple) and len(ai_date_range) == 2
+            
+            if st.button("📧 发送 Prompt", type="primary", use_container_width=True, disabled=(not ai_tag_groups or not is_range_valid)):
+                if is_range_valid:
+                    start_d, end_d = ai_date_range
+                    with st.spinner("正在生成分析..."):
+                        success, msg = generate_and_send_ai_prompt(
+                            user_id, 
+                            selected_ai_group, 
+                            start_d.strftime('%Y-%m-%d'), 
+                            end_d.strftime('%Y-%m-%d')
+                        )
+                        if success: st.success(msg)
+                        else: st.error(msg)
+                else:
+                    st.warning("请在日历中选择完整的【开始】和【结束】两个日期。")
 
+    st.divider()
     # 全局日期范围
     min_date = df_assets['date'].min().date()
     max_date = df_assets['date'].max().date()
@@ -960,16 +1021,33 @@ def page_dashboard():
         max_drawdown_pct = daily_total['daily_drawdown'].min()
 
         # --- 风险指标展示区 ---
-        st.subheader("🛡️ 风险与水位监控")
-        r1, r2, r3 = st.columns(3)
-        with r1:
-            st.metric("🏔️ 历史最高资产 (ATH)", f"{ath_amount/10000:,.2f}万")
-        with r2:
-            st.metric("📉 当前回撤", f"{current_drawdown_pct*100:.2f}%", 
-                      delta=f"{current_drawdown_pct*100:.2f}%", delta_color="inverse")
-        with r3:
-            st.metric("🌊 历史最大回撤 (MDD)", f"{max_drawdown_pct*100:.2f}%")
-            
+        st.subheader("🌊 风险与水位监控")
+        
+        # 1. 计算核心数据
+        daily_total['rolling_max'] = daily_total['amount'].cummax()
+        daily_total['drawdown'] = (daily_total['amount'] - daily_total['rolling_max']) / daily_total['rolling_max']
+        
+        # 2. 提取四个关键数值
+        current_val = daily_total.iloc[-1]['amount']     # 当前资产
+        max_val = daily_total['rolling_max'].max()       # 历史最高
+        current_dd = daily_total.iloc[-1]['drawdown']    # 当前回撤
+        max_mdd = daily_total['drawdown'].min()          # 历史最大回撤
+
+        # 3. 显示四个指标 (改成了4列)
+        m1, m2, m3, m4 = st.columns(4)
+        
+        with m1:
+            st.metric("💰 当前总资产", f"¥{current_val/10000:.2f}万")
+        with m2:
+            st.metric("🏔️ 历史最高 (ATH)", f"¥{max_val/10000:.2f}万")
+        with m3:
+            # 当前回撤：通常越接近0越好
+            st.metric("📉 当前回撤", f"{current_dd*100:.2f}%", 
+                    delta_color="off") # off表示不显示颜色箭头，或者用 'inverse'     
+        with m4:
+            # 历史最大回撤：这是一个静态的历史底线
+            st.metric("☠️ 历史最大回撤", f"{max_mdd*100:.2f}%",
+                    help="历史上最惨的一次跌幅")
         st.divider()
 
         # --- 2. 总资产净值走势图 ---
@@ -1060,125 +1138,115 @@ def page_dashboard():
             # 🔥 核心修改：分组柱状图对比 (美化 Tooltip 版)
             # =========================================================
             st.divider()
-            st.subheader("🆚 两期数据横向比对")
+            st.subheader("两期数据横向比对")
             st.caption(f"对比维度：**{view_mode}** | 直观展示两个时间点的数值变化")
+            # 获取有效日期范围供组件限制
+            valid_min = plot_df['date'].min().date()
+            valid_max = plot_df['date'].max().date()
             
-            valid_dates = sorted(plot_df['date'].unique())
-            if len(valid_dates) < 2:
-                st.warning("需要至少两天的数据才能进行对比。")
+            with st.container():
+                dc1, dc2, dc3 = st.columns([2, 2, 3])
+                with dc1:
+                    # 🔥 改为 date_input
+                    d1_input = st.date_input("📅 日期 A (旧)", value=valid_min, min_value=valid_min, max_value=valid_max, key="diff_d1")
+                with dc2:
+                    # 🔥 改为 date_input
+                    d2_input = st.date_input("📅 日期 B (新)", value=valid_max, min_value=valid_min, max_value=valid_max, key="diff_d2")
+                with dc3:
+                    diff_metric = st.radio("对比指标", ["总金额 (Amount)", "持有收益 (Profit)", "收益率 (Yield %)", "占比 (Share %)"], horizontal=True)
+
+            # 转换 input 为 datetime 以便和 dataframe 比较
+            d1_ts = pd.Timestamp(d1_input)
+            d2_ts = pd.Timestamp(d2_input)
+
+            # 检查所选日期是否有数据
+            has_d1 = not plot_df[plot_df['date'] == d1_ts].empty
+            has_d2 = not plot_df[plot_df['date'] == d2_ts].empty
+
+            if d1_ts == d2_ts:
+                st.info("请选择两个不同的日期。")
+            elif not has_d1 or not has_d2:
+                st.warning(f"所选日期无数据。请确保选中的日期 ({d1_input} 或 {d2_input}) 有资产快照记录。")
             else:
-                with st.container():
-                    dc1, dc2, dc3 = st.columns([2, 2, 3])
-                    with dc1:
-                        d1 = st.selectbox("📅 日期 A (旧)", valid_dates, index=max(0, len(valid_dates)-2), 
-                                        format_func=lambda x: x.strftime('%Y-%m-%d'), key="diff_d1")
-                    with dc2:
-                        d2 = st.selectbox("📅 日期 B (新)", valid_dates, index=len(valid_dates)-1, 
-                                        format_func=lambda x: x.strftime('%Y-%m-%d'), key="diff_d2")
-                    with dc3:
-                        diff_metric = st.radio("对比指标", 
-                                             ["总金额 (Amount)", "持有收益 (Profit)", "收益率 (Yield %)", "占比 (Share %)"], 
-                                             horizontal=True)
+                # ... (原来的绘图逻辑完全不用动，只需要把原来的 d1, d2 变量替换成 d1_ts, d2_ts) ...
+                if "总金额" in diff_metric: val_col = "amount"; unit_suffix = "元"
+                elif "持有收益" in diff_metric: val_col = "profit"; unit_suffix = "元"
+                elif "收益率" in diff_metric: val_col = "yield_rate"; unit_suffix = "%"
+                elif "占比" in diff_metric: val_col = "share"; unit_suffix = "%"
 
-                if d1 == d2:
-                    st.info("请选择两个不同的日期。")
+                df_d1 = plot_df[plot_df['date'] == d1_ts].copy() # 使用 ts
+                df_d1['Period'] = d1_ts.strftime('%Y-%m-%d')
+                
+                df_d2 = plot_df[plot_df['date'] == d2_ts].copy() # 使用 ts
+                df_d2['Period'] = d2_ts.strftime('%Y-%m-%d')
+                
+                df_viz = pd.concat([df_d1, df_d2], ignore_index=True)
+                
+                # ... (后续绘图代码保持不变，直到 Tab 2) ...
+                rank_order = df_d2.sort_values(val_col, ascending=False)[color_col].tolist()
+                fig_compare = px.bar(
+                    df_viz, x=color_col, y=val_col, color='Period', barmode='group', 
+                    title=f"{diff_metric} 对比: {d1_ts.strftime('%m-%d')} vs {d2_ts.strftime('%m-%d')}",
+                    category_orders={color_col: rank_order}, text_auto='.2s' if unit_suffix == "元" else '.2f'
+                )
+                # ... (Tooltip 代码不变) ...
+                metric_label = diff_metric.split(' ')[0]
+                if unit_suffix == "元":
+                    hover_template = f"<b>%{{x}}</b><br>📅 %{{fullData.name}}<br>{metric_label}: <b>¥%{{y:,.2f}}</b><extra></extra>"
                 else:
-                    # 2. 准备数据
-                    if "总金额" in diff_metric: val_col = "amount"; unit_suffix = "元"
-                    elif "持有收益" in diff_metric: val_col = "profit"; unit_suffix = "元"
-                    elif "收益率" in diff_metric: val_col = "yield_rate"; unit_suffix = "%"
-                    elif "占比" in diff_metric: val_col = "share"; unit_suffix = "%"
+                    hover_template = f"<b>%{{x}}</b><br>📅 %{{fullData.name}}<br>{metric_label}: <b>%{{y:.2f}}%</b><extra></extra>"
+                fig_compare.update_traces(hovertemplate=hover_template)
+                fig_compare.update_layout(yaxis_title=diff_metric, xaxis_title="", legend_title_text="", hovermode="x unified")
+                st.plotly_chart(fig_compare, use_container_width=True)
 
-                    df_d1 = plot_df[plot_df['date'] == d1].copy()
-                    df_d1['Period'] = d1.strftime('%Y-%m-%d')
-                    
-                    df_d2 = plot_df[plot_df['date'] == d2].copy()
-                    df_d2['Period'] = d2.strftime('%Y-%m-%d')
-                    
-                    df_viz = pd.concat([df_d1, df_d2], ignore_index=True)
-                    
-                    # 排序
-                    rank_order = df_d2.sort_values(val_col, ascending=False)[color_col].tolist()
-                    
-                    # 4. 绘图
-                    fig_compare = px.bar(
-                        df_viz, 
-                        x=color_col, 
-                        y=val_col, 
-                        color='Period', 
-                        barmode='group', 
-                        title=f"{diff_metric} 对比: {d1.strftime('%m-%d')} vs {d2.strftime('%m-%d')}",
-                        category_orders={color_col: rank_order}, 
-                        text_auto='.2s' if unit_suffix == "元" else '.2f'
-                    )
-                    
-                    # --- 🔥 定制美化 Tooltip (Hovertemplate) ---
-                    # 逻辑: 
-                    # %{x} 是 X轴名称(资产名)
-                    # %{fullData.name} 是 Trace名称(也就是 Period 日期)
-                    # %{y} 是 数值
-                    metric_label = diff_metric.split(' ')[0]
-                    
-                    if unit_suffix == "元":
-                        # 金额格式: ¥1,234.56
-                        hover_template = f"<b>%{{x}}</b><br>📅 %{{fullData.name}}<br>{metric_label}: <b>¥%{{y:,.2f}}</b><extra></extra>"
-                    else:
-                        # 百分比格式: 12.34%
-                        hover_template = f"<b>%{{x}}</b><br>📅 %{{fullData.name}}<br>{metric_label}: <b>%{{y:.2f}}%</b><extra></extra>"
+                with st.expander(f"查看 {diff_metric} 具体变动数值"):
+                    df_pivot = df_viz.pivot(index=color_col, columns='Period', values=val_col).reset_index()
+                    d1_str = d1_ts.strftime('%Y-%m-%d')
+                    d2_str = d2_ts.strftime('%Y-%m-%d')
+                    df_pivot = df_pivot.fillna(0)
+                    df_pivot['变动量'] = df_pivot[d2_str] - df_pivot[d1_str]
+                    df_pivot = df_pivot.sort_values(d2_str, ascending=False)
+                    st.dataframe(df_pivot, hide_index=True, use_container_width=True)
 
-                    fig_compare.update_traces(hovertemplate=hover_template)
-
-                    fig_compare.update_layout(
-                        yaxis_title=diff_metric,
-                        xaxis_title="",
-                        legend_title_text="",
-                        hovermode="x unified" # 开启统一悬停，方便左右对比
-                    )
-                    st.plotly_chart(fig_compare, use_container_width=True)
-
-                    # 5. 辅助数据表
-                    with st.expander(f"查看 {diff_metric} 具体变动数值"):
-                        df_pivot = df_viz.pivot(index=color_col, columns='Period', values=val_col).reset_index()
-                        d1_str = d1.strftime('%Y-%m-%d')
-                        d2_str = d2.strftime('%Y-%m-%d')
-                        df_pivot = df_pivot.fillna(0)
-                        df_pivot['变动量'] = df_pivot[d2_str] - df_pivot[d1_str]
-                        df_pivot = df_pivot.sort_values(d2_str, ascending=False)
-                        
-                        st.dataframe(
-                            df_pivot,
-                            column_config={
-                                color_col: "名称",
-                                d1_str: st.column_config.NumberColumn(f"{d1_str}", format="%.2f"),
-                                d2_str: st.column_config.NumberColumn(f"{d2_str}", format="%.2f"),
-                                "变动量": st.column_config.NumberColumn("变动量", format="%.2f", help="正数表示增加，负数表示减少"),
-                            },
-                            hide_index=True,
-                            use_container_width=True
-                        )
-
-    # === TAB 2 & TAB 3 (保持不变) ===
+    # === TAB 2: 每日透视 (已升级为日历组件) ===
     with tab2:
         st.subheader("🍰 每日资产快照分析")
         
+        # 1. 顶部控制栏
         control_c1, control_c2 = st.columns(2)
         with control_c1:
-            available_dates = sorted(df_assets['date'].unique(), reverse=True)
-            selected_date = st.selectbox("📅 选择要查看的日期", available_dates, format_func=lambda x: x.strftime('%Y-%m-%d'))
+            # 获取数据中的日期范围，限制日历选择器的上下限
+            default_date = df_assets['date'].max().date()
+            min_date = df_assets['date'].min().date()
+            
+            # 🔥 修改点：使用 date_input 日历组件
+            selected_date_input = st.date_input(
+                "📅 选择要查看的日期", 
+                value=default_date,
+                min_value=min_date,
+                max_value=default_date,
+                help="点击右侧日历图标选择日期"
+            )
+            # 关键：将 date 类型转为 pandas 的 Timestamp，否则跟数据库的时间格式对不上
+            selected_date = pd.Timestamp(selected_date_input)
         
         with control_c2:
+            # 维度选择器
             tag_groups = list(df_tags['tag_group'].unique()) if (df_tags is not None and not df_tags.empty) else []
             dim_options = ["按具体资产"] + tag_groups
             selected_dim = st.selectbox("🔍 分析维度 (筛选标签组)", dim_options)
 
         st.divider()
 
+        # 2. 数据准备与校验
+        # 检查选中的这一天到底有没有数据
         if selected_dim == "按具体资产":
+            # 筛选 assets 表
             day_data = df_assets[df_assets['date'] == selected_date].copy()
             name_col = 'name'
         else:
+            # 筛选 tags 表
             if df_tags is None:
-                st.warning("无标签数据")
                 day_data = pd.DataFrame()
             else:
                 day_data = df_tags[
@@ -1187,25 +1255,38 @@ def page_dashboard():
                 ].copy()
                 name_col = 'tag_name'
 
-        if not day_data.empty:
-            # 预计算 '万' 单位数据，用于饼图悬停
+        # 3. 如果当天无数据，显示提示；有数据则显示图表
+        if day_data.empty:
+            st.warning(f"📅 {selected_date_input} 当天没有录入数据。请尝试选择其他日期。")
+        else:
+            # --- 预计算辅助列 (用于 Tooltip 显示 '万') ---
             day_data['amount_w'] = day_data['amount'] / 10000
             day_data['profit_w'] = day_data['profit'] / 10000
 
+            # --- A. 核心指标卡片 ---
             day_total_amt = day_data['amount'].sum()
             day_total_profit = day_data['profit'].sum()
             
             m1, m2, m3 = st.columns(3)
-            m1.metric("当日总资产", f"{day_total_amt/10000:,.2f}w")
-            m2.metric("当日持有收益", f"{day_total_profit/10000:,.2f}w", 
-                      delta_color="normal" if day_total_profit >= 0 else "inverse")
-            if day_total_amt - day_total_profit != 0:
-                 total_yield = day_total_profit / (day_total_amt - day_total_profit) * 100
-                 m3.metric("当日综合收益率", f"{total_yield:.2f}%")
+            with m1:
+                st.metric("当日总资产", f"¥{day_total_amt/10000:,.2f}万")
+            with m2:
+                st.metric("当日持有收益", f"¥{day_total_profit/10000:,.2f}万", 
+                          delta_color="normal" if day_total_profit >= 0 else "inverse")
+            with m3:
+                # 计算当天的综合收益率
+                # 逻辑：收益 / (总资产 - 收益) = 收益 / 本金
+                total_cost = day_total_amt - day_total_profit
+                if total_cost != 0:
+                     total_yield = (day_total_profit / total_cost) * 100
+                     m3.metric("当日综合收益率", f"{total_yield:.2f}%")
+                else:
+                     m3.metric("当日综合收益率", "0.00%")
 
+            # --- B. 饼图区域 ---
             chart_c1, chart_c2 = st.columns(2)
             
-            # --- 饼图 A: 总金额 ---
+            # 饼图 1: 总金额占比
             with chart_c1:
                 fig_pie_amt = px.pie(
                     day_data, 
@@ -1213,21 +1294,21 @@ def page_dashboard():
                     names=name_col, 
                     title=f"【总金额】占比 ({selected_dim})", 
                     hole=0.4,
-                    # 将计算好的 '万' 数据传进去
-                    custom_data=['amount_w']
+                    custom_data=['amount_w'] # 传入万单位数据
                 )
                 fig_pie_amt.update_traces(
                     textposition='inside', 
                     textinfo='percent+label',
-                    # 格式：名称: 💰金额w (🍰百分比)
-                    hovertemplate='<b>%{label}</b>: 💰%{customdata[0]:.2f}w (🍰%{percent})<extra></extra>'
+                    hovertemplate='<b>%{label}</b>: 💰%{customdata[0]:.2f}万 (🍰%{percent})<extra></extra>'
                 )
                 st.plotly_chart(fig_pie_amt, use_container_width=True)
             
-            # --- 饼图 B: 收益/贡献 ---
+            # 饼图 2: 收益贡献占比
             with chart_c2:
-                if (day_data['profit'] < 0).any():
-                    st.caption("⚠️ 注意：饼图仅展示盈利部分。")
+                # 只有当存在正收益时才画这个图，否则全是负的画饼图很怪
+                if (day_data['profit'] > 0).any():
+                    # 只展示赚钱的部分，或者全部展示（看个人喜好，这里逻辑是全部）
+                    # 为了饼图好看，通常只画正值。如果想看亏损，建议看下面的表格。
                     pos_profit_data = day_data[day_data['profit'] > 0]
                     if not pos_profit_data.empty:
                         fig_pie_prof = px.pie(
@@ -1241,29 +1322,21 @@ def page_dashboard():
                         fig_pie_prof.update_traces(
                             textposition='inside', 
                             textinfo='percent+label',
-                            hovertemplate='<b>%{label}</b>: 📈%{customdata[0]:.2f}w (🍰%{percent})<extra></extra>'
+                            hovertemplate='<b>%{label}</b>: 📈%{customdata[0]:.2f}万 (🍰%{percent})<extra></extra>'
                         )
                         st.plotly_chart(fig_pie_prof, use_container_width=True)
+                    else:
+                        st.info("当日无正收益资产。")
                 else:
-                    fig_pie_prof = px.pie(
-                        day_data, 
-                        values='profit', 
-                        names=name_col, 
-                        title=f"【持有收益】占比 ({selected_dim})", 
-                        hole=0.4,
-                        custom_data=['profit_w']
-                    )
-                    fig_pie_prof.update_traces(
-                        textposition='inside', 
-                        textinfo='percent+label',
-                        hovertemplate='<b>%{label}</b>: 📈%{customdata[0]:.2f}w (🍰%{percent})<extra></extra>'
-                    )
-                    st.plotly_chart(fig_pie_prof, use_container_width=True)
+                    st.info("当日所有资产均为负收益或零收益，暂不展示贡献图。")
 
-            # 4. 详细数据表
-            st.subheader(f"📋 详细数据表")
+            # --- C. 详细数据表格 ---
+            st.subheader(f"📋 详细数据清单")
+            
+            # 整理显示列
             display_cols = [name_col, 'amount', 'profit', 'yield_rate']
-            if 'cost' in day_data.columns: display_cols.insert(2, 'cost')
+            if 'cost' in day_data.columns: 
+                display_cols.insert(2, 'cost')
             
             show_df = day_data[display_cols].copy()
             show_df = show_df.sort_values('amount', ascending=False)
@@ -1272,15 +1345,16 @@ def page_dashboard():
                 show_df,
                 column_config={
                     name_col: "名称/标签",
-                    "amount": st.column_config.NumberColumn("总金额", format="¥%.2f"),
-                    "cost": st.column_config.NumberColumn("本金", format="¥%.2f"),
-                    "profit": st.column_config.NumberColumn("持有收益", format="¥%.2f"),
+                    "amount": st.column_config.NumberColumn("总金额 (¥)", format="%.2f"),
+                    "cost": st.column_config.NumberColumn("本金 (¥)", format="%.2f"),
+                    "profit": st.column_config.NumberColumn("持有收益 (¥)", format="%.2f"),
                     "yield_rate": st.column_config.NumberColumn("收益率", format="%.2f%%"),
                 },
                 use_container_width=True,
                 hide_index=True
             )
 
+            # 导出按钮
             csv_day = show_df.to_csv(index=False).encode('utf-8-sig')
             st.download_button(
                 label=f"📥 导出当日数据表 ({selected_date.strftime('%Y-%m-%d')})",
@@ -1288,9 +1362,6 @@ def page_dashboard():
                 file_name=f'daily_snapshot_{selected_date.strftime("%Y%m%d")}.csv',
                 mime='text/csv'
             )
-        else:
-            st.info("该日期/维度下无数据。")
-
     # === TAB 3 (保持不变) ===
     with tab3:
         st.subheader("⚠️ 数据完整性检查")
@@ -1307,6 +1378,8 @@ def page_dashboard():
 
 # --- 新增页面：定投计划与看板 ---
 def page_investment_plans():
+    import pandas as pd          # 👈 加上这句
+    import plotly.express as px  # 👈 加上这句
     st.header("📅 定投计划与未来现金流")
     user_id = st.session_state.user['user_id']
     conn = get_db_connection()
@@ -1582,6 +1655,8 @@ def page_investment_plans():
     conn.close()
 
 def page_rebalance():
+    import pandas as pd            # 👈 加上这句
+    import plotly.graph_objects as go  # 👈 加上这句
     st.header("⚖️ 投资组合再平衡助手")
     st.caption("设定你的理想资产配比，系统将计算如何调整仓位以维持风险平衡。")
     
@@ -1768,6 +1843,7 @@ def page_rebalance():
     conn.close()
 
 def page_investment_notes():
+    import pandas as pd  # 👈 加上这句
     st.header("📒 投资笔记与复盘")
     st.caption("记录每一次决策的思考，构建自己的投资体系。")
     
@@ -1895,6 +1971,8 @@ def page_investment_notes():
     conn.close()
 
 def page_fire_projection():
+    import pandas as pd            # 👈 加上这句
+    import plotly.graph_objects as go  # 👈 加上这句
     st.header("🔥 FIRE 财富自由展望 2.0")
     st.caption("引入通胀调节与风险区间，还原最真实的财富自由之路。")
     
@@ -2151,10 +2229,11 @@ def send_email_backup(filepath, settings):
     except Exception as e:
         return False, f"邮件准备失败: {str(e)}"
 
-def generate_and_send_ai_prompt(user_id, target_group, target_date_str):
+def generate_and_send_ai_prompt(user_id, target_group, start_date_str, end_date_str):
     """
-    生成 AI 顾问提示词并发送邮件 (支持指定日期 & 维度)
+    生成 AI 顾问提示词 (基于日期范围)
     """
+    import pandas as pd
     conn = get_db_connection()
     
     # --- 1. 获取系统设置 ---
@@ -2170,68 +2249,73 @@ def generate_and_send_ai_prompt(user_id, target_group, target_date_str):
         conn.close()
         return False, "暂无资产数据，无法生成分析。"
 
-    # 转换日期格式以便比较
-    # 确保 target_date_str 是 YYYY-MM-DD 格式，df 中的 date 是 datetime
-    target_date = pd.to_datetime(target_date_str)
+    # 转换日期格式
+    start_date = pd.to_datetime(start_date_str)
+    end_date = pd.to_datetime(end_date_str)
 
-    # A. 总体概况 (筛选指定日期)
+    # A. 总体概况
     daily_total = df_assets.groupby('date')[['amount', 'profit', 'cost']].sum().reset_index().sort_values('date')
     
-    # 找到目标日期的那一行
-    target_row_df = daily_total[daily_total['date'] == target_date]
-    if target_row_df.empty:
+    # 获取 起点(Start) 和 终点(End) 的数据
+    row_start_df = daily_total[daily_total['date'] == start_date]
+    row_end_df = daily_total[daily_total['date'] == end_date]
+
+    if row_end_df.empty:
         conn.close()
-        return False, f"找不到日期 {target_date_str} 的资产数据。"
+        return False, f"找不到结束日期 {end_date_str} 的资产数据。"
     
-    target_row = target_row_df.iloc[0]
-    
-    # 环比数据 (和目标日期的 30 天前相比)
-    try:
-        month_ago_date = target_date - timedelta(days=30)
-        # 找一个离30天前最近的日期 (<= 30天前)
-        past_rows = daily_total[daily_total['date'] <= month_ago_date]
-        if not past_rows.empty:
-            month_ago_row = past_rows.iloc[-1]
-            month_change = target_row['amount'] - month_ago_row['amount']
-            month_change_pct = (month_change / month_ago_row['amount']) * 100
-        else:
-            month_change = 0
-            month_change_pct = 0
-    except:
-        month_change = 0
-        month_change_pct = 0
+    # 如果起点没数据，就尝试找起点之后最近的一天，或者置空
+    if row_start_df.empty:
+        # 简单处理：如果没有确切的开始日期，就无法计算精确变化
+        row_start = None
+    else:
+        row_start = row_start_df.iloc[0]
+        
+    row_end = row_end_df.iloc[0]
 
-    # B. 风险指标 (计算截止到目标日期的回撤)
-    # 只取截止到 target_date 的历史数据来算回撤
-    history_slice = daily_total[daily_total['date'] <= target_date].copy()
+    # 计算区间变化
+    period_change = 0
+    period_change_pct = 0.0
+    if row_start is not None:
+        period_change = row_end['amount'] - row_start['amount']
+        period_change_pct = (period_change / row_start['amount']) * 100 if row_start['amount'] != 0 else 0
+
+    # B. 风险指标 (计算区间内的最大回撤)
+    # 只取区间内的数据来算
+    period_slice = daily_total[(daily_total['date'] >= start_date) & (daily_total['date'] <= end_date)].copy()
+    if not period_slice.empty:
+        period_slice['rolling_max'] = period_slice['amount'].cummax()
+        period_slice['drawdown'] = (period_slice['amount'] - period_slice['rolling_max']) / period_slice['rolling_max']
+        max_mdd = period_slice['drawdown'].min() * 100
+    else:
+        max_mdd = 0.0
+        
+    # 当前回撤 (相对于历史最高)
+    # 这通常需要看截止到 end_date 的全历史
+    history_slice = daily_total[daily_total['date'] <= end_date].copy()
     history_slice['rolling_max'] = history_slice['amount'].cummax()
-    history_slice['drawdown'] = (history_slice['amount'] - history_slice['rolling_max']) / history_slice['rolling_max']
-    
-    max_mdd = history_slice['drawdown'].min() * 100
-    current_dd = history_slice.iloc[-1]['drawdown'] * 100
+    current_dd = ((history_slice.iloc[-1]['amount'] - history_slice['rolling_max'].max()) / history_slice['rolling_max'].max()) * 100
 
-    # C. 持仓结构 (Top 5 资产 - 指定日期)
-    target_assets = df_assets[df_assets['date'] == target_date].copy()
+    # C. 持仓结构 (Top 5 资产 - 终点日期)
+    target_assets = df_assets[df_assets['date'] == end_date].copy()
     target_assets = target_assets.sort_values('amount', ascending=False)
     
     top_5_str = ""
     for i, row in target_assets.head(5).iterrows():
         currency_info = f" ({row['currency']})" if 'currency' in row and row['currency'] != 'CNY' else ""
-        top_5_str += f"- {row['name']}{currency_info}: ¥{row['amount']:,.0f} (占比 {(row['amount']/target_row['amount']*100):.1f}%)\n"
+        top_5_str += f"- {row['name']}{currency_info}: ¥{row['amount']:,.0f} (占比 {(row['amount']/row_end['amount']*100):.1f}%)\n"
 
-    # D. 标签分布 (指定日期 & 用户指定的 target_group)
+    # D. 标签分布 (终点日期 & 用户指定的 target_group)
     alloc_str = ""
     if df_tags is not None and not df_tags.empty:
-        target_tags = df_tags[df_tags['date'] == target_date]
-        
-        # 筛选指定标签组
+        target_tags = df_tags[df_tags['date'] == end_date]
         group_data = target_tags[target_tags['tag_group'] == target_group].sort_values('amount', ascending=False)
         
         if group_data.empty:
              alloc_str = "(该标签组下暂无数据)"
         else:
             for i, row in group_data.iterrows():
-                alloc_str += f"- {row['tag_name']}: {(row['amount']/target_row['amount']*100):.1f}%\n"
+                alloc_str += f"- {row['tag_name']}: {(row['amount']/row_end['amount']*100):.1f}%\n"
     else:
         alloc_str = "(暂无标签数据)"
 
@@ -2242,40 +2326,27 @@ def generate_and_send_ai_prompt(user_id, target_group, target_date_str):
 ===== 复制以下内容发送给 AI =====
 
 【角色设定】
-你是一位专业的私人财富管理顾问，擅长资产配置、风险控制和 FIRE (Financial Independence, Retire Early) 规划。你信奉长期主义，风格理性客观。
+你是一位专业的私人财富管理顾问。
+**复盘周期：{start_date_str} 至 {end_date_str}**
 
-【背景信息】
-我是一名 FIRE 追求者。
-**数据快照日期：{target_date_str}** (请基于该日期的历史状态进行复盘分析)
+以下是该周期的资产组合变动数据（已折算为人民币 CNY）：
 
-以下是该日期的资产组合快照（已折算为人民币 CNY）：
+1. 核心变动：
+   - 期末总净值：¥{row_end['amount']:,.0f}
+   - 期间净值变动：¥{period_change:+,.0f} ({period_change_pct:+.2f}%)
+   - 期间累计收益：¥{row_end['profit']:,.0f} (截至期末)
+   - 期间最大回撤：{max_mdd:.2f}%
+   - 当前距离历史高点回撤：{current_dd:.2f}%
 
-1. 核心数据：
-   - 当日总净值：¥{target_row['amount']:,.0f}
-   - 累计持有收益：¥{target_row['profit']:,.0f} (收益率 {(target_row['profit']/target_row['cost']*100 if target_row['cost']!=0 else 0):.2f}%)
-   - 近30天变动：¥{month_change:,.0f} ({month_change_pct:+.2f}%)
-   - 历史最大回撤：{max_mdd:.2f}% (截止当日)
-   - 当前回撤：{current_dd:.2f}%
-
-2. 前五大持仓 (集中度风险参考)：
+2. 期末前五大持仓：
 {top_5_str}
-3. 资产配置比例 (基于我的 "{target_group}" 分类)：
+3. 期末资产配置比例 (基于 "{target_group}" 分类)：
 {alloc_str}
 
 【分析任务】
-请基于以上数据，简明扼要地回答以下问题：
-
-1. **组合健康度诊断**：
-   - 我的资产配置（按 {target_group}）是否存在严重的结构性风险？
-   - 结合当时的回撤情况，我的风险控制是否在合理范围？
-
-2. **复盘分析**：
-   - 针对该节点前 30 天的资产变动，请尝试分析当时的潜在原因。
-
-3. **操作建议**：
-   - 如果我处于该时间节点，针对当时的持仓结构，有什么优化建议？
-
-请保持回答专业、客观，无需客套，直接输出分析结果。
+1. **周期复盘**：针对这期间 {period_change_pct:+.2f}% 的变动，结合宏观环境分析可能的成因。
+2. **风险评估**：当前 {current_dd:.2f}% 的回撤水平是否健康？
+3. **优化建议**：基于期末的持仓结构，下一阶段应如何调整？
 
 ================================
     """
@@ -2283,11 +2354,11 @@ def generate_and_send_ai_prompt(user_id, target_group, target_date_str):
     # --- 4. 发送邮件 ---
     try:
         msg = MIMEMultipart()
-        msg['Subject'] = f'🤖 AI 投顾提示词 ({target_date_str}) - {datetime.now().strftime("%Y-%m-%d")}'
+        msg['Subject'] = f'🤖 AI 复盘 ({start_date_str} ~ {end_date_str})'
         msg['From'] = settings['email_user']
         msg['To'] = settings['email_to'] if settings['email_to'] else settings['email_user']
         
-        body = "这是为您自动生成的 AI 复盘提示词。请复制下方的文本，发送给 ChatGPT / Claude / DeepSeek 进行分析。\n\n" + prompt_content
+        body = "这是为您自动生成的 AI 复盘提示词。\n\n" + prompt_content
         msg.attach(MIMEText(body, 'plain'))
 
         server = smtplib.SMTP_SSL(settings['email_host'], settings['email_port'])
@@ -2295,10 +2366,10 @@ def generate_and_send_ai_prompt(user_id, target_group, target_date_str):
         server.send_message(msg)
         server.quit()
         
-        return True, f"已发送 {target_date_str} 的分析提示词至邮箱！"
+        return True, f"已发送 {start_date_str} 至 {end_date_str} 的分析提示词！"
     except Exception as e:
         return False, f"邮件发送失败: {str(e)}"
-  
+
 def perform_backup(manual=False):
     """执行备份：1.本地复制 2.发送邮件 3.更新时间"""
     conn = get_db_connection()
@@ -2383,6 +2454,7 @@ def auto_backup_check():
         conn.close()
 
 def page_settings():
+    import pandas as pd  # 👈 加上这句
     st.header("⚙️ 系统设置与备份")
     conn = get_db_connection()
     
