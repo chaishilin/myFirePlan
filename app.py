@@ -798,6 +798,140 @@ def page_data_entry():
         # --- [插入位置结束] ---
     conn.close()
 
+
+def page_cashflow():
+    import pandas as pd
+    import plotly.express as px
+    
+    st.header("💰 现金流与本金归集")
+    st.caption("“模糊记账法”核心：只记大额进出，倒推本金投入。")
+    
+    user_id = st.session_state.user['user_id']
+    conn = get_db_connection()
+
+    # --- 1. 顶部：极简录入区 ---
+    with st.container(border=True):
+        st.subheader("➕ 新增记录")
+        c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 3, 1])
+        
+        with c1:
+            record_date = st.date_input("日期", datetime.now(), key="cf_date")
+        
+        with c2:
+            flow_type = st.selectbox("类型", ["📥 收入 (投入本金)", "📤 支出 (消耗本金)"], key="cf_type")
+            
+        with c3:
+            amount = st.number_input("金额", min_value=0.0, step=1000.0, format="%.2f", key="cf_amt")
+            
+        with c4:
+            # 根据类型动态改变建议选项
+            if "收入" in flow_type:
+                options = ["工资/奖金", "理财赎回", "其他收入"]
+            else:
+                options = ["信用卡/花呗账单", "房贷/房租", "大额转账", "其他大额支出"]
+            category = st.selectbox("类别 (可编辑)", options, key="cf_cat") # 也可以用 text_input + suggestions
+            
+        with c5:
+            st.write("")
+            st.write("")
+            if st.button("💾 记一笔", type="primary", use_container_width=True):
+                if amount > 0:
+                    real_type = "收入" if "收入" in flow_type else "支出"
+                    conn.execute('''
+                        INSERT INTO cashflows (user_id, date, type, amount, category, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    ''', (user_id, record_date.strftime('%Y-%m-%d'), real_type, amount, category, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+                    conn.commit()
+                    st.success("已记录")
+                    import time
+                    time.sleep(0.5)
+                    st.rerun()
+                else:
+                    st.warning("金额需大于0")
+
+    # --- 2. 中部：年度统计卡片 ---
+    current_year = datetime.now().year
+    df_cf = pd.read_sql('''
+        SELECT id, date, type, amount, category, note 
+        FROM cashflows 
+        WHERE user_id = ? 
+        ORDER BY date DESC
+    ''', conn, params=(user_id,))
+    
+    if not df_cf.empty:
+        df_cf['date'] = pd.to_datetime(df_cf['date'])
+        df_cf['year'] = df_cf['date'].dt.year
+        
+        # 本年度统计
+        df_this_year = df_cf[df_cf['year'] == current_year]
+        income_year = df_this_year[df_this_year['type'] == '收入']['amount'].sum()
+        expense_year = df_this_year[df_this_year['type'] == '支出']['amount'].sum()
+        net_input = income_year - expense_year
+        
+        st.divider()
+        st.markdown(f"### 📅 {current_year} 年度本金投入概览")
+        k1, k2, k3 = st.columns(3)
+        k1.metric("📥 本年累计大额收入", f"¥{income_year:,.2f}")
+        k2.metric("📤 本年累计大额支出", f"¥{expense_year:,.2f}")
+        k3.metric("🌱 本年净投入本金", f"¥{net_input:,.2f}", 
+                 delta="这是你的努力存下的钱" if net_input > 0 else "本金正在流出",
+                 delta_color="normal" if net_input > 0 else "inverse")
+
+    # --- 3. 底部：数据管理 (DataEditor) ---
+    st.divider()
+    st.subheader("📋 历史明细管理")
+    
+    if not df_cf.empty:
+        # 为了 DataEditor 显示友好，做一点处理
+        df_display = df_cf[['id', 'date', 'type', 'amount', 'category', 'note']].copy()
+        df_display['date'] = df_display['date'].dt.date
+        
+        edited_df = st.data_editor(
+            df_display,
+            column_config={
+                "id": st.column_config.NumberColumn("ID", disabled=True, width="small"),
+                "date": st.column_config.DateColumn("日期", format="YYYY-MM-DD"),
+                "type": st.column_config.SelectboxColumn("类型", options=["收入", "支出"], required=True),
+                "amount": st.column_config.NumberColumn("金额", format="%.2f", min_value=0),
+                "category": st.column_config.TextColumn("类别"),
+                "note": st.column_config.TextColumn("备注"),
+            },
+            use_container_width=True,
+            num_rows="dynamic",
+            key="cf_editor"
+        )
+        
+        if st.button("💾 保存修改 (支持删除)", type="secondary"):
+            # 复用你的 save_changes_to_db 逻辑，或者简单写个处理
+            # 这里简单写个处理 ID 的逻辑
+            try:
+                # 1. 找出被删除的
+                orig_ids = set(df_cf['id'].tolist())
+                new_ids = set(edited_df['id'].dropna().tolist())
+                del_ids = orig_ids - new_ids
+                
+                for did in del_ids:
+                    conn.execute("DELETE FROM cashflows WHERE id = ?", (did,))
+                
+                # 2. 更新/新增
+                for index, row in edited_df.iterrows():
+                    if pd.isna(row['id']): # 新增
+                         conn.execute("INSERT INTO cashflows (user_id, date, type, amount, category, note) VALUES (?,?,?,?,?,?)",
+                                      (user_id, row['date'], row['type'], row['amount'], row['category'], row['note']))
+                    elif row['id'] in new_ids: # 修改
+                         conn.execute("UPDATE cashflows SET date=?, type=?, amount=?, category=?, note=? WHERE id=?",
+                                      (row['date'], row['type'], row['amount'], row['category'], row['note'], row['id']))
+                
+                conn.commit()
+                st.success("更新成功")
+                st.rerun()
+            except Exception as e:
+                st.error(f"保存失败: {e}")
+    else:
+        st.info("暂无记录，请在上方添加。")
+
+    conn.close()
+
 def get_latest_rates(conn):
     import pandas as pd  # 👈 加上这句
     """获取系统中每种货币最新的汇率 (对CNY)"""
@@ -992,8 +1126,8 @@ def page_dashboard():
     
     st.caption(f"数据统计范围：{min_date} ~ {max_date}")
     
-    tab1, tab2, tab3 = st.tabs(["📈 趋势分析", "🍰 每日透视", "⚠️ 数据校验"])
-
+    tab1, tab2, tab3, tab4 = st.tabs(["📈 趋势分析", "🍰 每日透视", "⚠️ 数据校验", "🏆 年度财富复盘"])
+    
     # === TAB 1: 趋势分析 ===
     with tab1:
         # --- 1. 数据聚合与预处理 ---
@@ -1375,6 +1509,146 @@ def page_dashboard():
                 st.success("🎉 数据完整。")
         else:
             st.write("暂无标签数据。")
+
+    # === TAB 4: 年度财富复盘 (核心联动功能) ===
+    with tab4:
+        st.subheader("🏆 年度财富归因分析")
+        st.caption("上帝视角：你的钱到底是【赚】来的，还是【存】来的？")
+        
+        # --- 1. 数据准备 ---
+        # A. 获取每年的资产增量 (Asset Delta)
+        # 逻辑：取每年最后一天的总资产 - 上一年最后一天的总资产
+        
+        # 为了准确，我们按年分组，取 max(date)
+        df_assets['year'] = df_assets['date'].dt.year
+        
+       # --- ✅ 优化后的代码 (确保先算出当天的总钱数) ---
+        # 1. 先算出每天的总资产
+        daily_sum = df_assets.groupby('date')['amount'].sum().reset_index()
+        daily_sum['year'] = daily_sum['date'].dt.year
+        
+        # 2. 再取每年的最后一天
+        yearly_end = daily_sum.sort_values('date').groupby('year').last().reset_index()
+        yearly_end.rename(columns={'amount': 'end_amount'}, inplace=True)
+        
+        # 计算每年的增量
+        # 先获取整个数据最早日期之前的初始状态（假设为0，或者用户录入的第一笔就是初始）
+        # 这里用 shift 简单计算：今年的增量 = 今年底 - 去年底
+        yearly_end['prev_amount'] = yearly_end['end_amount'].shift(1).fillna(0) # 第一年默认增量就是年底余额（假设从0开始），这可能不准，但对于趋势分析可以接受
+        yearly_end['asset_delta'] = yearly_end['end_amount'] - yearly_end['prev_amount']
+        conn = get_db_connection()  # <--- 加上这一行
+        # B. 获取每年的净投入 (Net Input)
+        df_cf = pd.read_sql("SELECT date, type, amount FROM cashflows WHERE user_id = ?", conn, params=(user_id,))
+        if df_cf.empty:
+            st.warning("⚠️ 暂无现金流记录，无法计算本金投入。请先去【现金流与本金归集】页面录入工资和账单。")
+            yearly_cf = pd.DataFrame(columns=['year', 'net_input'])
+        else:
+            df_cf['date'] = pd.to_datetime(df_cf['date'])
+            df_cf['year'] = df_cf['date'].dt.year
+            # 收入记正，支出记负
+            df_cf['signed_amount'] = df_cf.apply(lambda x: x['amount'] if x['type'] == '收入' else -x['amount'], axis=1)
+            yearly_cf = df_cf.groupby('year')['signed_amount'].sum().reset_index()
+            yearly_cf.rename(columns={'signed_amount': 'net_input'}, inplace=True)
+            
+        # C. 合并数据
+        df_attribution = pd.merge(yearly_end, yearly_cf, on='year', how='left')
+        df_attribution['net_input'] = df_attribution['net_input'].fillna(0)
+        
+        # D. 计算市场收益 (Market Alpha)
+        # 公式：市场收益 = 资产增量 - 净投入
+        df_attribution['market_alpha'] = df_attribution['asset_delta'] - df_attribution['net_input']
+        
+        # 单位换算 (万)
+        for c in ['end_amount', 'asset_delta', 'net_input', 'market_alpha']:
+            df_attribution[f'{c}_w'] = df_attribution[c] / 10000
+
+        # --- 2. 绘图 (堆叠柱状图) ---
+        if not df_attribution.empty:
+            # 转换格式适配 Plotly
+            # 我们需要把 data 变长：Year, Type, Value
+            viz_data = []
+            for _, row in df_attribution.iterrows():
+                # 1. 净投入柱子
+                viz_data.append({
+                    'Year': str(int(row['year'])),
+                    'Type': '🌱 净投入本金 (工资结余)',
+                    'Value': row['net_input_w'],
+                    'RawValue': row['net_input'],
+                    'Color': '#3498DB' # 蓝色
+                })
+                # 2. 市场收益柱子
+                viz_data.append({
+                    'Year': str(int(row['year'])),
+                    'Type': '🚀 市场投资收益 (Alpha)',
+                    'Value': row['market_alpha_w'],
+                    'RawValue': row['market_alpha'],
+                    'Color': '#E74C3C' if row['market_alpha'] < 0 else '#2ECC71' # 绿赚红亏
+                })
+                
+            df_viz = pd.DataFrame(viz_data)
+            
+            # 使用 Graph Objects 画图以获得最大自由度 (相对模式)
+            fig = go.Figure()
+            
+            # 分组处理不同 Type
+            for t in df_viz['Type'].unique():
+                subset = df_viz[df_viz['Type'] == t]
+                fig.add_trace(go.Bar(
+                    x=subset['Year'],
+                    y=subset['Value'],
+                    name=t,
+                    marker_color=subset['Color'],
+                    text=subset['Value'].apply(lambda x: f"{x:+.1f}w"),
+                    textposition='auto',
+                    hovertemplate='<b>%{x}年 - %{data.name}</b><br>金额: %{y:.2f}万<extra></extra>'
+                ))
+            
+            # 叠加一条“总资产增量”的折线，方便对比
+            fig.add_trace(go.Scatter(
+                x=df_attribution['year'].astype(str),
+                y=df_attribution['asset_delta_w'],
+                name='💰 当年总资产增量',
+                mode='lines+markers',
+                line=dict(color='#F1C40F', width=3, dash='dot'),
+                hovertemplate='当年总增量: %{y:.2f}万<extra></extra>'
+            ))
+
+            fig.update_layout(
+                barmode='relative', # 关键！允许正负值堆叠
+                yaxis_title="金额 (万元)",
+                hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+
+            # --- 3. 详细数据表 ---
+            st.divider()
+            with st.expander("查看详细归因数据表"):
+                st.dataframe(
+                    df_attribution[['year', 'asset_delta', 'net_input', 'market_alpha', 'end_amount']],
+                    column_config={
+                        "year": st.column_config.NumberColumn("年份", format="%d"),
+                        "asset_delta": st.column_config.NumberColumn("总资产增量", format="¥%.2f"),
+                        "net_input": st.column_config.NumberColumn("净投入本金", format="¥%.2f"),
+                        "market_alpha": st.column_config.NumberColumn("市场收益", format="¥%.2f"),
+                        "end_amount": st.column_config.NumberColumn("年末总资产", format="¥%.2f"),
+                    },
+                    hide_index=True,
+                    use_container_width=True
+                )
+            
+            # --- 4. 智能点评 ---
+            last_year = df_attribution.iloc[-1]
+            if last_year['market_alpha'] > last_year['net_input'] and last_year['market_alpha'] > 0:
+                st.success(f"🎉 **双轮驱动 ({(int(last_year['year']))})**：恭喜！今年你的【睡后收入】(¥{last_year['market_alpha_w']:.1f}万) 超过了你的【工资结余】(¥{last_year['net_input_w']:.1f}万)。这是 FIRE 路上重要的里程碑！")
+            elif last_year['market_alpha'] < 0:
+                st.info(f"🛡️ **积谷防饥 ({(int(last_year['year']))})**：今年市场环境艰难 (亏损 ¥{abs(last_year['market_alpha_w']):.1f}万)，但好在你通过努力工作存下了 ¥{last_year['net_input_w']:.1f}万，守住了财富底线。")
+            else:
+                st.info(f"🧱 **通过积累成长 ({(int(last_year['year']))})**：今年财富增长主要来自于本金投入。继续保持储蓄率，等待市场风起！")
+
+        else:
+            st.info("数据不足，无法生成年度复盘。需要至少一年的跨度数据。")
 
 # --- 新增页面：定投计划与看板 ---
 def page_investment_plans():
@@ -2671,6 +2945,7 @@ def main():
             # C. 动态导航菜单
             nav_keys = [
                 "nav_dashboard", 
+                "nav_cashflow",  # 👈 新增菜单项
                 "nav_notes", 
                 "nav_assets", 
                 "nav_entry", 
@@ -2696,6 +2971,8 @@ def main():
         # === 页面路由分发 ===
         if selected_key == "nav_dashboard":
             page_dashboard()
+        elif selected_key == "nav_cashflow": # 👈 新增路由
+            page_cashflow()
         elif selected_key == "nav_notes":
             page_investment_notes()
         elif selected_key == "nav_assets":

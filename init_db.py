@@ -156,6 +156,20 @@ def init_db():
     )
     ''')
 
+    # 创建 cashflows 表
+    conn.execute('''
+            CREATE TABLE IF NOT EXISTS cashflows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                date TEXT,
+                type TEXT,      -- '收入', '支出'
+                amount REAL,
+                category TEXT,  -- '工资', '信用卡', '大额转账' 等
+                note TEXT,
+                created_at TEXT
+    )
+    ''')
+
     conn.commit()
     conn.close()
     print("✅ 数据库结构初始化完成 (含最新字段：is_cleared, currency, remarks 及汇率表)")
