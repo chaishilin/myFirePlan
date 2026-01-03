@@ -5,7 +5,6 @@ import hashlib
 import os
 import shutil
 from pathlib import Path
-from PIL import Image # 👈 新增这行，用于处理图片
 import re
 import calendar # 用于处理月份天数
 # 在 app.py 头部引入
@@ -21,7 +20,6 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
-from languages import TRANSLATIONS
 
 # 🔥 修改这里：智能判断数据库路径
 # 如果系统里有 /share 这个文件夹，说明是在 HA 里，就把数据库存那里
@@ -37,22 +35,9 @@ else:
 #    np.bool8 = np.bool_
 
 # --- 配置 ---
-# 1. 定义图片文件名 (请确保你把图片放到了同级目录，且名字一致)
-ICON_FILE = 'logo.png' 
-
-# 2. 尝试加载图片，如果找不到文件，就用默认的 Emoji 💼
-if os.path.exists(ICON_FILE):
-    try:
-        page_icon = Image.open(ICON_FILE)
-    except Exception:
-        page_icon = "💼" # 图片损坏时的兜底
-else:
-    page_icon = "💼" # 文件不存在时的兜底
-
-# 3. 应用配置
 st.set_page_config(
     page_title="个人资产管理系统",
-    page_icon=page_icon, # 这里传入图片对象或Emoji字符串
+    page_icon="💼", # 直接写死 Emoji，不要加载图片了
     layout="wide"
 )
 
@@ -1553,14 +1538,6 @@ def page_dashboard():
                 hide_index=True
             )
 
-            # 导出按钮
-            csv_day = show_df.to_csv(index=False).encode('utf-8-sig')
-            st.download_button(
-                label=f"📥 导出当日数据表 ({selected_date.strftime('%Y-%m-%d')})",
-                data=csv_day,
-                file_name=f'daily_snapshot_{selected_date.strftime("%Y%m%d")}.csv',
-                mime='text/csv'
-            )
     # === TAB 3 (保持不变) ===
     with tab3:
         st.subheader("⚠️ 数据完整性检查")
@@ -1984,20 +1961,6 @@ def page_investment_plans():
                 )
                 
                 st.plotly_chart(fig, use_container_width=True)
-
-                # --- 可视化 C: 日历清单 ---
-                with st.expander("查看详细扣款日历"):
-                    st.dataframe(
-                        df_proj.sort_values('date'),
-                        column_config={
-                            "date": "日期",
-                            "asset_name": "扣款资产",
-                            "amount_cny": st.column_config.NumberColumn("折合金额 (CNY)", format="¥%.2f"),
-                            "raw_info": "原币金额"
-                        },
-                        hide_index=True,
-                        use_container_width=True
-                    )
 
     conn.close()
 
@@ -2567,10 +2530,6 @@ def page_fire_projection():
             
             annual_rate = st.number_input("预期年化收益率 (%)", value=8.0, step=0.5, help="长期来看，标普500约 8-10%")
             
-            # 🔥 这里把 max_value 限制得小一点，防止用户填太夸张的数字
-            volatility = st.slider("长期收益波动 (±%)", min_value=0.0, max_value=4.0, value=1.5, step=0.5, 
-                                 help="这是对【长期平均年化收益】的敏感度测试。例如填 1.5%，表示测试 6.5% ~ 9.5% 的区间。")
-
         with c3:
             inflation_rate = st.number_input("预估通胀率 (%)", value=3.0, step=0.1)
             target_monthly_expense = st.number_input("理想月生活费 (元)", value=10000, step=1000)
@@ -2599,74 +2558,50 @@ def page_fire_projection():
     projection_data = []
     
     curr_bal = base_amount
-    curr_bal_opt = base_amount 
-    curr_bal_pess = base_amount 
     curr_principal = base_amount
     
+    # 初始年份数据
     projection_data.append({
         "year": start_year, "age": current_age,
         "balance": curr_bal, "balance_real": curr_bal,
-        "balance_opt": curr_bal_opt, "balance_pess": curr_bal_pess,
         "principal": curr_principal
     })
 
     for i in range(1, years_to_project + 1):
+        # 核心复利公式
         curr_bal = curr_bal * (1 + annual_rate / 100.0) + annual_addition
-        curr_bal_opt = curr_bal_opt * (1 + (annual_rate + volatility) / 100.0) + annual_addition
-        curr_bal_pess = curr_bal_pess * (1 + (annual_rate - volatility) / 100.0) + annual_addition
         curr_principal += annual_addition
+        
+        # 真实购买力 (剔除通胀)
         real_purchasing_power = curr_bal / ((1 + inflation_rate / 100.0) ** i)
         
         projection_data.append({
             "year": start_year + i, "age": current_age + i,
             "balance": curr_bal, "balance_real": real_purchasing_power,
-            "balance_opt": curr_bal_opt, "balance_pess": curr_bal_pess,
             "principal": curr_principal
         })
 
     df_proj = pd.DataFrame(projection_data)
-    cols_to_convert = ['balance', 'balance_real', 'balance_opt', 'balance_pess', 'principal']
+    # 单位换算为“万”
+    cols_to_convert = ['balance', 'balance_real', 'principal']
     for c in cols_to_convert: df_proj[f'{c}_w'] = df_proj[c] / 10000
 
-    # --- 5. 绘图 (Plotly) - 🔥 核心美化部分 ---
-    st.subheader("📈 资产推演：名义 vs 真实 vs 风险区间")
+    # --- 5. 绘图 (Plotly) ---
+    st.subheader("📈 资产推演：名义 vs 真实")
     
     fig = go.Figure()
 
-    # A. 乐观预测 (区间上沿) - 透明线，主要为了Tooltip
-    fig.add_trace(go.Scatter(
-        x=df_proj['age'], y=df_proj['balance_opt_w'],
-        mode='lines',
-        line=dict(width=0),
-        name='乐观预测',
-        showlegend=False,
-        customdata=df_proj['year'], # 传入年份供tooltip使用
-        hovertemplate=f'<b>🦄 乐观剧本 (+{volatility}%)</b><br>年份: %{{customdata}}<br>资产: <b>%{{y:.0f}}万</b><extra></extra>'
-    ))
-
-    # B. 悲观预测 (区间下沿 + 填充)
-    fig.add_trace(go.Scatter(
-        x=df_proj['age'], y=df_proj['balance_pess_w'],
-        mode='lines',
-        line=dict(width=0),
-        fill='tonexty', # 填充到上一条线(乐观线)
-        fillcolor='rgba(46, 134, 193, 0.15)', # 更淡一点的蓝色
-        name=f'波动区间 (±{volatility}%)',
-        customdata=df_proj['year'],
-        hovertemplate=f'<b>🐢 悲观剧本 (-{volatility}%)</b><br>年份: %{{customdata}}<br>资产: <b>%{{y:.0f}}万</b><extra></extra>'
-    ))
-
-    # C. 名义总资产 (中轴线)
+    # A. 名义总资产
     fig.add_trace(go.Scatter(
         x=df_proj['age'], y=df_proj['balance_w'],
         mode='lines',
-        name='名义预期 (中性)',
+        name='名义预期',
         line=dict(color='#2E86C1', width=3),
         customdata=df_proj['year'],
         hovertemplate='<b>⚖️ 名义预期</b><br>年份: %{customdata}<br>资产: <b>%{y:.0f}万</b><extra></extra>'
     ))
 
-    # D. 真实购买力
+    # B. 真实购买力
     fig.add_trace(go.Scatter(
         x=df_proj['age'], y=df_proj['balance_real_w'],
         mode='lines',
@@ -2676,7 +2611,7 @@ def page_fire_projection():
         hovertemplate='<b>🍔 真实购买力</b><br>年份: %{customdata}<br>折合现值: <b>%{y:.0f}万</b><extra></extra>'
     ))
 
-    # E. 投入本金
+    # C. 投入本金
     fig.add_trace(go.Scatter(
         x=df_proj['age'], y=df_proj['principal_w'],
         mode='lines',
@@ -2690,41 +2625,36 @@ def page_fire_projection():
         xaxis_title="年龄", yaxis_title="金额 (万)",
         hovermode="x unified",
         legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01),
-        height=550
+        height=500
     )
     st.plotly_chart(fig, use_container_width=True)
 
     # --- 6. 关键数据解读 ---
-    real_break_even = df_proj[df_proj['balance_real'] > df_proj['principal']].head(1)
+    # 找20年后的数据
     target_year_20 = df_proj.iloc[20]
 
     st.info(f"""
-    **💡 深度解读：**
+    **💡 深度解读 (20年后 / {int(target_year_20['year'])}年)：**
     
-    * **风险区间的意义**：如果未来20年市场表现比预期好 **{volatility}%**（即年化 {annual_rate+volatility}%），你将拥有 **{target_year_20['balance_opt_w']:.0f}万**。
-    * **悲观底线**：如果市场表现比预期差 **{volatility}%**（即年化 {annual_rate-volatility}%），你仍将拥有 **{target_year_20['balance_pess_w']:.0f}万**。
-    * **购买力警告**：20年后账面上的 **{target_year_20['balance_w']:.0f}万**，在超市里只能买到相当于今天 **{target_year_20['balance_real_w']:.0f}万** 的东西。
+    * **账面富贵**：按照预期，20年后你的账户里会有 **{target_year_20['balance_w']:.0f}万**。
+    * **真实缩水**：但在 {inflation_rate}% 的通胀下，这笔钱的购买力只相当于今天的 **{target_year_20['balance_real_w']:.0f}万**。
+    * **对抗通胀**：只要【名义预期】那条蓝线跑赢了【真实购买力】红虚线，就说明你的财富在增值。
     """, icon="🧐")
 
     # --- 7. 数据表 ---
     with st.expander("查看详细推演数据"):
         st.dataframe(
-            df_proj[['age', 'year', 'balance_w', 'balance_real_w', 'balance_pess_w', 'balance_opt_w', 'principal_w']],
+            df_proj[['age', 'year', 'balance_w', 'balance_real_w', 'principal_w']],
             column_config={
                 "age": "年龄",
                 "year": "年份",
                 "balance_w": st.column_config.NumberColumn("名义资产 (万)", format="%.0f"),
                 "balance_real_w": st.column_config.NumberColumn("真实购买力 (万)", format="%.0f"),
-                # 👇 新增下面这两行 👇
-                "balance_pess_w": st.column_config.NumberColumn("悲观底线 (万)", format="%.0f"),
-                "balance_opt_w": st.column_config.NumberColumn("乐观预测 (万)", format="%.0f"),
-                # 👆 新增上面这两行 👆
                 "principal_w": st.column_config.NumberColumn("累计本金 (万)", format="%.0f"),
             },
             hide_index=True,
             use_container_width=True
         )
-
   
 # --- 备份核心逻辑 ---
 def send_email_backup(filepath, settings):
@@ -2910,7 +2840,7 @@ def generate_and_send_ai_prompt(user_id, target_group, start_date_str, end_date_
 
 # Context / 复盘背景
 - **复盘周期**：{start_date_str} 至 {end_date_str}
-- **用户画像**：中国投资者，以人民币计价，关注全球资产配置。
+- **用户画像**：中国个人投资者，以人民币计价。
 
 # Internal Data / 内部投资组合数据
 
@@ -3205,12 +3135,6 @@ def page_settings():
 
     conn.close()
 
-# --- 翻译助手函数 ---
-def t(key):
-    """根据当前语言返回翻译，找不到则返回 key"""
-    lang = st.session_state.get('language', 'zh') # 默认为中文
-    return TRANSLATIONS.get(lang, TRANSLATIONS['zh']).get(key, key)
-
 # ==============================================================================
 # 🚀 主程序入口 (Main)
 # ==============================================================================
@@ -3218,14 +3142,10 @@ def main():
     # 1. 基础初始化
     init_db()
     
-    # 2. 初始化语言状态
-    if 'language' not in st.session_state:
-        st.session_state.language = 'zh'
-
-    # 3. 自动备份检查
+    # 2. 自动备份检查
     auto_backup_check()
 
-    # 4. Token 自动登录
+    # 3. Token 自动登录
     if 'user' not in st.session_state or st.session_state.user is None:
         token = st.query_params.get("token")
         if token:
@@ -3233,76 +3153,38 @@ def main():
             if user:
                 st.session_state.user = user
 
-    # 5. 登录拦截逻辑
+    # 4. 登录拦截逻辑
     if 'user' not in st.session_state or st.session_state.user is None:
-        # 登录页侧边栏：语言选择
-        with st.sidebar:
-            st.markdown("### 🌐 Language")
-            lang_code = st.selectbox(
-                "选择语言 / Language",
-                options=["zh", "en", "ja"],
-                format_func=lambda x: {"zh": "🇨🇳 中文", "en": "🇺🇸 English", "ja": "🇯🇵 日本語"}[x],
-                index=["zh", "en", "ja"].index(st.session_state.language),
-                key="lang_select_login"
-            )
-            if lang_code != st.session_state.language:
-                st.session_state.language = lang_code
-                st.rerun()
-                
+        # 未登录：直接显示登录页 (移除了侧边栏语言选择)
         page_login() 
     else:
         # === 已登录状态：侧边栏导航 ===
         with st.sidebar:
-            # --- 🔥 新增：Logo 图片展示区 ---
-            # 直接复用之前定义的图片文件名
-            LOGO_FILE = 'logo.png' 
-            if os.path.exists(LOGO_FILE):
-                # width 参数控制图片大小，100-150 左右比较合适侧边栏
-                st.image(LOGO_FILE, width=200) 
-            
-            # 稍微加一点点空隙
-            st.write("")
 
-            # A. 用户信息区 (独占一行，大标题)
-            # 使用 subheader 让名字显眼，但不像 title 那么占地
-            st.subheader(t('sidebar_welcome').format(st.session_state.user['username']))
+            # A. 用户信息区
+            st.subheader(f"欢迎回来, {st.session_state.user['username']}")
             
-            # B. 语言切换区 (独占一行，标准宽度)
-            # 这里的 label 可以留空，因为图标已经很直观了，或者写个通用的 "🌐 Language"
-            lang_code = st.selectbox(
-                "🌐 Language / 言語",
-                options=["zh", "en", "ja"],
-                format_func=lambda x: {"zh": "🇨🇳 中文", "en": "🇺🇸 English", "ja": "🇯🇵 日本語"}[x],
-                index=["zh", "en", "ja"].index(st.session_state.language),
-                key="lang_select_sidebar"
-            )
-            if lang_code != st.session_state.language:
-                st.session_state.language = lang_code
-                st.rerun()
-
             st.divider()
 
-            # C. 动态导航菜单
-            nav_keys = [
-                "nav_dashboard", 
-                "nav_cashflow",  # 👈 新增菜单项
-                "nav_performance",
-                "nav_notes", 
-                "nav_assets", 
-                "nav_entry", 
-                "nav_plans", 
-                "nav_rebalance",
-                "nav_fire", 
-                "nav_settings"
-            ]
-            nav_labels = [t(k) for k in nav_keys]
+            # B. 静态中文导航菜单
+            # 使用字典映射：显示名称 -> 函数Key
+            nav_map = {
+                "📊 资产看板": "nav_dashboard",
+                "💰 现金流与本金": "nav_cashflow",
+                "🏆 累计收益": "nav_performance",
+                "📒 投资笔记": "nav_notes",
+                "🏦 资产管理": "nav_assets",
+                "📝 数据录入": "nav_entry",
+                "📅 定投计划": "nav_plans",
+                "⚖️ 投资再平衡": "nav_rebalance",
+                "🔥 FIRE推演": "nav_fire",
+                "⚙️ 系统设置": "nav_settings"
+            }
             
-            selected_label = st.radio(t("sidebar_nav"), nav_labels)
+            selected_label = st.radio("导航菜单", list(nav_map.keys()))
+            selected_key = nav_map[selected_label]
             
-            selected_index = nav_labels.index(selected_label)
-            selected_key = nav_keys[selected_index]
-            
-            # 👇👇👇 在 退出登录 按钮之前，加上这个 👇👇👇
+            # 树莓派缓存刷新按钮
             if IS_RASPBERRY_PI:
                 st.divider()
                 if st.button("🔄 强制刷新数据", help="树莓派模式下：如果你更新了底层数据库文件，点此清除缓存"):
@@ -3310,9 +3192,9 @@ def main():
                     st.toast("缓存已清除，正在重新加载...", icon="🚀")
                     st.rerun()
 
-            # D. 退出按钮
+            # C. 退出按钮
             st.divider()
-            if st.button(t("btn_logout"), use_container_width=True):
+            if st.button("🚪 退出登录", use_container_width=True):
                 st.session_state.user = None
                 st.query_params.clear()
                 st.rerun()
@@ -3320,9 +3202,9 @@ def main():
         # === 页面路由分发 ===
         if selected_key == "nav_dashboard":
             page_dashboard()
-        elif selected_key == "nav_cashflow": # 👈 新增路由
+        elif selected_key == "nav_cashflow":
             page_cashflow()
-        elif selected_key == "nav_performance": # 👈 新增
+        elif selected_key == "nav_performance":
             page_performance()
         elif selected_key == "nav_notes":
             page_investment_notes()
@@ -3341,3 +3223,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+    
