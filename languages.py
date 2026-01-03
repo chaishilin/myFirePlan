@@ -308,6 +308,8 @@ TRANSLATIONS = {
         "sidebar_welcome": "欢迎回来, {}",
         "sidebar_nav": "导航菜单",
         "nav_dashboard": "📊 资产看板",
+        "nav_cashflow": "💰 现金流与本金",
+        "nav_performance": "🏆累计收益",
         "nav_notes": "📒 投资笔记",
         "nav_assets": "🏦 资产管理",
         "nav_entry": "📝 数据录入",

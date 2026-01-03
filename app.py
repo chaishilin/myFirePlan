@@ -5,12 +5,16 @@ import hashlib
 import os
 import shutil
 from pathlib import Path
+from PIL import Image # 👈 新增这行，用于处理图片
 import re
+import calendar # 用于处理月份天数
+# 在 app.py 头部引入
+from streamlit import cache_data  # 如果之前没引
 # ❌ 删除或注释掉这些行：
-import pandas as pd
-import plotly.express as px
-import numpy as np
-import plotly.graph_objects as go
+#import pandas as pd
+#import plotly.express as px
+#import numpy as np
+#import plotly.graph_objects as go
 from datetime import timedelta
 import uuid
 import smtplib
@@ -33,9 +37,22 @@ else:
 #    np.bool8 = np.bool_
 
 # --- 配置 ---
+# 1. 定义图片文件名 (请确保你把图片放到了同级目录，且名字一致)
+ICON_FILE = 'logo.png' 
+
+# 2. 尝试加载图片，如果找不到文件，就用默认的 Emoji 💼
+if os.path.exists(ICON_FILE):
+    try:
+        page_icon = Image.open(ICON_FILE)
+    except Exception:
+        page_icon = "💼" # 图片损坏时的兜底
+else:
+    page_icon = "💼" # 文件不存在时的兜底
+
+# 3. 应用配置
 st.set_page_config(
     page_title="个人资产管理系统",
-    page_icon="💼",
+    page_icon=page_icon, # 这里传入图片对象或Emoji字符串
     layout="wide"
 )
 
@@ -742,6 +759,7 @@ def page_data_entry():
                     ''', (row['asset_id'], str_date, amt, prof, cost, y_rate, is_clr))
                     c += 1
                 conn.commit()
+                st.cache_data.clear()
                 st.success(f"已保存 {c} 条记录！")
                 # 稍微延迟一下自动刷新，让用户看到成功提示
                 import time
@@ -942,108 +960,119 @@ def get_latest_rates(conn):
     # drop_duplicates 默认保留第一个，也就是最新的
     return df.drop_duplicates(subset=['currency']).set_index('currency')['rate'].to_dict()
 
-# --- 辅助函数：核心数据处理逻辑 ---
-def process_analytics_data(conn, user_id):
-    import pandas as pd  # 👈 加上这句
+
+# ==============================================================================
+# 🚀 核心优化：智能缓存分析函数 (PC实时算 / 树莓派存硬盘)
+# ==============================================================================
+
+# 1. 定义环境与策略
+IS_RASPBERRY_PI = os.path.exists('/share') # 复用你之前的判断逻辑
+
+if IS_RASPBERRY_PI:
+    # 🍓 树莓派模式：硬盘持久化，永不过期 (除非手动点刷新)
+    # 这样重启 Streamlit 后依然秒开
+    CACHE_PARAMS = {
+        "persist": "disk", 
+        "ttl": None, 
+        "show_spinner": "正在从硬盘读取历史数据 (树莓派模式)..."
+    }
+else:
+    # 💻 PC 开发模式：ttl=0 等于不缓存/立即过期
+    # 每次刷新都重新计算，方便你调试代码或数据
+    CACHE_PARAMS = {
+        "persist": None, 
+        "ttl": 0, 
+        "show_spinner": "正在实时计算 (PC开发模式)..."
+    }
+
+# 2. 应用动态参数
+@st.cache_data(**CACHE_PARAMS)
+def get_cached_analytics_data(user_id):
     """
-    提取快照数据，并根据当天的汇率将所有非CNY资产折算为CNY。
+    替代原来的 process_analytics_data，增加了智能缓存机制
     """
-    # 1. 获取基础数据 (增加 currency)
-    df_raw = pd.read_sql('''
-        SELECT s.date, s.asset_id, s.amount, s.profit, s.cost, s.yield_rate, a.name, a.currency
-        FROM snapshots s
-        JOIN assets a ON s.asset_id = a.asset_id
-        WHERE a.user_id = ?
-    ''', conn, params=(user_id,))
+    # 延迟加载重型库
+    import pandas as pd
+    import sqlite3
+    
+    # 函数内部建立连接 (因为连接对象不能被缓存)
+    local_conn = sqlite3.connect(DB_FILE)
+    
+    try:
+        # --- 原有逻辑开始 ---
+        # 1. 获取基础数据
+        df_raw = pd.read_sql('''
+            SELECT s.date, s.asset_id, s.amount, s.profit, s.cost, s.yield_rate, a.name, a.currency
+            FROM snapshots s
+            JOIN assets a ON s.asset_id = a.asset_id
+            WHERE a.user_id = ?
+        ''', local_conn, params=(user_id,))
 
-    if df_raw.empty:
-        return None, None
+        if df_raw.empty:
+            return None, None
 
-    df_raw['date'] = pd.to_datetime(df_raw['date'])
-    
-    # 2. 获取汇率表
-    # 为了性能，一次性把汇率拉出来
-    df_rates = pd.read_sql("SELECT date, currency, rate FROM exchange_rates", conn)
-    df_rates['date'] = pd.to_datetime(df_rates['date'])
-    
-    # 3. 汇率匹配与折算
-    # 将汇率表 merge 到主表上
-    # left join: 如果找不到那天的汇率，我们会得到 NaN，后面处理成 1.0 (原样)
-    df_merged = pd.merge(
-        df_raw, 
-        df_rates, 
-        on=['date', 'currency'], 
-        how='left'
-    )
-    
-    # 填充汇率: 
-    # 1. 如果 currency 是 CNY，rate 设为 1
-    # 2. 如果是外币但没找到汇率，暂时设为 1 (或者可以做更复杂的向前填充)
-    df_merged['rate'] = df_merged.apply(
-        lambda row: 1.0 if row['currency'] == 'CNY' else row['rate'], axis=1
-    )
-    # 对于没填汇率的外币，给个默认值 1.0，避免计算变成 NaN
-    df_merged['rate'] = df_merged['rate'].fillna(1.0)
-    
-    # --- 核心折算 ---
-    # 所有后续分析都基于这两个 _cny 后缀的列
-    df_merged['amount_cny'] = df_merged['amount'] * df_merged['rate']
-    df_merged['profit_cny'] = df_merged['profit'] * df_merged['rate']
-    df_merged['cost_cny'] = df_merged['cost'] * df_merged['rate']
-    
-    # 4. 获取标签关联关系 (不变)
-    df_tags = pd.read_sql('''
-        SELECT t.tag_group, t.tag_name, atm.asset_id
-        FROM tags t
-        JOIN asset_tag_map atm ON t.tag_id = atm.tag_id
-        WHERE t.user_id = ?
-    ''', conn, params=(user_id,))
-
-    # 5. 标签维度聚合 (使用折算后的人民币数值)
-    tag_analytics = []
-    
-    if not df_tags.empty:
-        # 将快照与标签关联
-        merged_tags = pd.merge(df_merged, df_tags, on='asset_id', how='inner')
+        df_raw['date'] = pd.to_datetime(df_raw['date'])
         
-        tag_asset_counts = df_tags.groupby(['tag_group', 'tag_name'])['asset_id'].nunique().to_dict()
-        grouped = merged_tags.groupby(['date', 'tag_group', 'tag_name'])
+        # 2. 获取汇率表
+        df_rates = pd.read_sql("SELECT date, currency, rate FROM exchange_rates", local_conn)
+        df_rates['date'] = pd.to_datetime(df_rates['date'])
         
-        for name, group in grouped:
-            date, tag_group, tag_name = name
+        # 3. 汇率匹配与折算
+        df_merged = pd.merge(df_raw, df_rates, on=['date', 'currency'], how='left')
+        
+        df_merged['rate'] = df_merged.apply(
+            lambda row: 1.0 if row['currency'] == 'CNY' else row['rate'], axis=1
+        )
+        df_merged['rate'] = df_merged['rate'].fillna(1.0)
+        
+        df_merged['amount_cny'] = df_merged['amount'] * df_merged['rate']
+        df_merged['profit_cny'] = df_merged['profit'] * df_merged['rate']
+        df_merged['cost_cny'] = df_merged['cost'] * df_merged['rate']
+        
+        # 4. 获取标签
+        df_tags = pd.read_sql('''
+            SELECT t.tag_group, t.tag_name, atm.asset_id
+            FROM tags t
+            JOIN asset_tag_map atm ON t.tag_id = atm.tag_id
+            WHERE t.user_id = ?
+        ''', local_conn, params=(user_id,))
+
+        # 5. 标签聚合计算
+        tag_analytics = []
+        if not df_tags.empty:
+            merged_tags = pd.merge(df_merged, df_tags, on='asset_id', how='inner')
+            tag_asset_counts = df_tags.groupby(['tag_group', 'tag_name'])['asset_id'].nunique().to_dict()
+            grouped = merged_tags.groupby(['date', 'tag_group', 'tag_name'])
             
-            # 使用 _cny 列进行求和
-            total_amount = group['amount_cny'].sum()
-            total_profit = group['profit_cny'].sum()
-            total_cost = group['cost_cny'].sum()
-            
-            weighted_yield = (total_profit / total_cost * 100) if total_cost != 0 else 0.0
-            
-            current_count = group['asset_id'].nunique()
-            expected_count = tag_asset_counts.get((tag_group, tag_name), 0)
-            
-            tag_analytics.append({
-                'date': date,
-                'tag_group': tag_group,
-                'tag_name': tag_name,
-                'amount': total_amount, # 此时已是人民币
-                'profit': total_profit,
-                'cost': total_cost,
-                'yield_rate': weighted_yield,
-                'is_complete': current_count == expected_count,
-                'missing_count': expected_count - current_count
-            })
-            
-    df_tags_agg = pd.DataFrame(tag_analytics)
-    
-    # 返回原始数据时，建议也把 amount 替换成 amount_cny，这样 Dashboard 里的总览图（Tab 1）就不用改代码了
-    # 我们构造一个符合 Dashboard 预期的 df_assets
-    df_final_assets = df_merged.copy()
-    df_final_assets['amount'] = df_final_assets['amount_cny']
-    df_final_assets['profit'] = df_final_assets['profit_cny']
-    df_final_assets['cost'] = df_final_assets['cost_cny']
-    
-    return df_final_assets, df_tags_agg
+            for name, group in grouped:
+                date, tag_group, tag_name = name
+                total_amount = group['amount_cny'].sum()
+                total_profit = group['profit_cny'].sum()
+                total_cost = group['cost_cny'].sum()
+                weighted_yield = (total_profit / total_cost * 100) if total_cost != 0 else 0.0
+                current_count = group['asset_id'].nunique()
+                expected_count = tag_asset_counts.get((tag_group, tag_name), 0)
+                
+                tag_analytics.append({
+                    'date': date, 'tag_group': tag_group, 'tag_name': tag_name,
+                    'amount': total_amount, 'profit': total_profit, 'cost': total_cost,
+                    'yield_rate': weighted_yield, 'is_complete': current_count == expected_count,
+                    'missing_count': expected_count - current_count
+                })
+                
+        df_tags_agg = pd.DataFrame(tag_analytics)
+        
+        # 构造返回
+        df_final_assets = df_merged.copy()
+        df_final_assets['amount'] = df_final_assets['amount_cny']
+        df_final_assets['profit'] = df_final_assets['profit_cny']
+        df_final_assets['cost'] = df_final_assets['cost_cny']
+        # --- 原有逻辑结束 ---
+        
+        return df_final_assets, df_tags_agg
+        
+    finally:
+        local_conn.close()
 
 # --- 新版看板页面 ---
 def page_dashboard():
@@ -1058,11 +1087,13 @@ def page_dashboard():
         np.bool8 = np.bool_
     st.header("📊 深度资产透视")
     user_id = st.session_state.user['user_id']
-    conn = get_db_connection()
+    
+    #conn = get_db_connection()
+    ## 处理数据
+    #df_assets, df_tags = process_analytics_data(conn, user_id)
+    #conn.close()
 
-    # 处理数据
-    df_assets, df_tags = process_analytics_data(conn, user_id)
-    conn.close()
+    df_assets, df_tags = get_cached_analytics_data(user_id)
 
     if df_assets is None or df_assets.empty:
         st.info("👋 暂无数据，请先前往【数据录入】页面添加资产快照。")
@@ -1163,11 +1194,18 @@ def page_dashboard():
         
         # 2. 提取四个关键数值
         current_val = daily_total.iloc[-1]['amount']     # 当前资产
-        max_val = daily_total['rolling_max'].max()       # 历史最高
-        current_dd = daily_total.iloc[-1]['drawdown']    # 当前回撤
-        max_mdd = daily_total['drawdown'].min()          # 历史最大回撤
+        max_val = daily_total['rolling_max'].max()       # 历史最高 (ATH)
+        
+        # --- 🔥 新增逻辑：计算金额亏损 ---
+        current_dd = daily_total.iloc[-1]['drawdown']    # 当前回撤率 (%)
+        current_dd_amt = current_val - max_val           # 当前回撤金额 (绝对值)
+        
+        max_mdd = daily_total['drawdown'].min()          # 历史最大回撤率 (%)
+        # 找到历史上回撤最大的那一天，计算那一天的金额亏损
+        mdd_row = daily_total.loc[daily_total['drawdown'].idxmin()]
+        max_mdd_amt = mdd_row['amount'] - mdd_row['rolling_max']
 
-        # 3. 显示四个指标 (改成了4列)
+        # 3. 显示四个指标
         m1, m2, m3, m4 = st.columns(4)
         
         with m1:
@@ -1175,13 +1213,22 @@ def page_dashboard():
         with m2:
             st.metric("🏔️ 历史最高 (ATH)", f"¥{max_val/10000:.2f}万")
         with m3:
-            # 当前回撤：通常越接近0越好
-            st.metric("📉 当前回撤", f"{current_dd*100:.2f}%", 
-                    delta_color="off") # off表示不显示颜色箭头，或者用 'inverse'     
+            # 当前回撤：Value显示百分比，Delta显示具体亏损金额
+            st.metric(
+                "📉 当前回撤", 
+                f"{current_dd*100:.2f}%", 
+                delta=f"{current_dd_amt/10000:.2f}万 (浮亏)", 
+                delta_color="normal" # 红色表示亏损
+            ) 
         with m4:
-            # 历史最大回撤：这是一个静态的历史底线
-            st.metric("☠️ 历史最大回撤", f"{max_mdd*100:.2f}%",
-                    help="历史上最惨的一次跌幅")
+            # 历史最大回撤
+            st.metric(
+                "☠️ 历史最大回撤", 
+                f"{max_mdd*100:.2f}%",
+                delta=f"{max_mdd_amt/10000:.2f}万 (当时浮亏)",
+                delta_color="normal",
+                help=f"发生于 {mdd_row['date'].strftime('%Y-%m-%d')}，当时从高点跌去了 {abs(max_mdd_amt/10000):.2f}万"
+            )
         st.divider()
 
         # --- 2. 总资产净值走势图 ---
@@ -1217,9 +1264,27 @@ def page_dashboard():
         plot_df = None
         color_col = ""
         
+        
         if view_mode == "按具体资产":
             plot_df = df_assets.copy()
             color_col = "name"
+            
+            # --- 🔥 新增：资产筛选多选框 ---
+            # 获取所有出现在历史记录里的资产名称并排序
+            all_names = sorted(plot_df['name'].unique().tolist())
+            
+            # 插入一个多选框
+            selected_assets = st.multiselect(
+                "🔍 筛选特定资产 (可多选，支持搜索)",
+                options=all_names,
+                placeholder="默认显示全部资产。如需精简，请在此处选择...",
+                key="trend_asset_filter"
+            )
+            
+            # 如果用户选了至少一个，就过滤；如果没选，就显示全部
+            if selected_assets:
+                plot_df = plot_df[plot_df['name'].isin(selected_assets)]
+                
         else: 
             if df_tags is None or df_tags.empty:
                 st.warning("暂无标签数据。")
@@ -1228,7 +1293,7 @@ def page_dashboard():
                 selected_group = st.selectbox("选择标签分组", groups, key="trend_group")
                 plot_df = df_tags[df_tags['tag_group'] == selected_group].copy()
                 color_col = "tag_name"
-        
+
         if plot_df is not None:
             # 预计算绘图字段
             plot_df['amt_w'] = plot_df['amount'] / 10000
@@ -1796,7 +1861,15 @@ def page_investment_plans():
             )
             
             if st.button("💾 保存计划变更"):
-                if save_changes_to_db(edited_plans, plans_df, 'investment_plans', 'plan_id', user_id, fixed_cols={'user_id':user_id}):
+                # --- 🔥 修复：剔除纯展示用的列，防止写入数据库报错 ---
+                # 'name', 'currency' 是从 assets 表联查出来的，'描述' 是前端计算的
+                # 数据库表 investment_plans 里没有这些字段
+                cols_to_drop = ['name', 'currency', '描述']
+                
+                # 过滤掉这些列，只保留数据库表里有的字段 (如 amount, frequency, execution_day, is_active)
+                df_to_save = edited_plans.drop(columns=[c for c in cols_to_drop if c in edited_plans.columns])
+                
+                if save_changes_to_db(df_to_save, plans_df, 'investment_plans', 'plan_id', user_id, fixed_cols={'user_id':user_id}):
                     st.rerun()
         else:
             st.info("暂无定投计划。")
@@ -1957,9 +2030,7 @@ def page_rebalance():
         selected_group = st.selectbox("选择配置维度", groups_list, index=default_idx)
 
     # --- 2. 获取当前持仓数据 (Real) ---
-    # 注意：这里需要复用 process_analytics_data 里的逻辑，获取基于最新汇率折算后的 CNY 价值
-    # 为了简单，我们直接调用 process_analytics_data (稍微有点性能浪费但逻辑最稳)
-    _, df_tags = process_analytics_data(conn, user_id)
+    _, df_tags = get_cached_analytics_data(user_id)
     
     if df_tags is None or df_tags.empty:
         st.info("暂无资产数据。")
@@ -2113,6 +2184,210 @@ def page_rebalance():
                     st.progress(min(1.0, over_ratio))
             else:
                 st.write("✅ 无需卖出")
+
+    conn.close()
+
+def page_performance():
+    import pandas as pd
+    import plotly.express as px
+    import calendar
+    from datetime import datetime, timedelta
+
+    st.header("🏆 投资战绩与月度复盘")
+    st.caption("手动记录每月的最终战果，不纠结过程，只看结果。")
+
+    user_id = st.session_state.user['user_id']
+    conn = get_db_connection()
+
+    # --- 1. 核心维度选择 (数据隔离墙) ---
+    all_groups_df = pd.read_sql("SELECT DISTINCT tag_group FROM tags WHERE user_id = ?", conn, params=(user_id,))
+    
+    if all_groups_df.empty:
+        st.warning("⚠️ 请先去【资产与标签管理】定义标签组（例如新建一个组叫“资金渠道”）。")
+        conn.close()
+        return
+
+    # 智能定位默认组
+    default_idx = 0
+    g_list = all_groups_df['tag_group'].tolist()
+    for kw in ["渠道", "账户", "来源"]:
+        matches = [i for i, x in enumerate(g_list) if kw in x]
+        if matches:
+            default_idx = matches[0]
+            break
+            
+    selected_group = st.selectbox("📂 记账维度", g_list, index=default_idx)
+    
+    # 获取该组下的标签
+    tags_in_group = pd.read_sql("SELECT tag_name FROM tags WHERE user_id = ? AND tag_group = ?", 
+                              conn, params=(user_id, selected_group))
+    
+    if tags_in_group.empty:
+        st.info(f"标签组【{selected_group}】下没有标签，请先去添加。")
+        conn.close()
+        return
+        
+    tag_names = tags_in_group['tag_name'].tolist()
+
+    st.divider()
+
+    # --- 2. 数据录入区 (双下拉框 + 自动覆盖) ---
+    with st.expander("📝 录入/修改 月度数据", expanded=False):
+        # 优雅的年月选择
+        today = datetime.now()
+        last_month_date = today.replace(day=1) - timedelta(days=1)
+        default_year = last_month_date.year
+        default_month = last_month_date.month
+
+        c_y, c_m, _ = st.columns([1, 1, 3])
+        with c_y:
+            sel_year = st.selectbox("年份", list(range(default_year - 5, default_year + 3)), index=5, key="perf_sel_year")
+        with c_m:
+            sel_month = st.selectbox("月份", range(1, 13), index=default_month - 1, key="perf_sel_month")
+
+        month_str = f"{sel_year}-{sel_month:02d}"
+        
+        # 预读取数据
+        existing_data = pd.read_sql('''
+            SELECT tag_name, amount FROM monthly_profits 
+            WHERE user_id = ? AND month = ? AND tag_group = ?
+        ''', conn, params=(user_id, month_str, selected_group))
+        data_map = dict(zip(existing_data['tag_name'], existing_data['amount']))
+        
+        existing_note = conn.execute('''
+            SELECT content FROM monthly_reviews 
+            WHERE user_id = ? AND month = ? AND tag_group = ?
+        ''', (user_id, month_str, selected_group)).fetchone()
+        note_val = existing_note['content'] if existing_note else ""
+
+        with st.form("perf_entry_form"):
+            st.caption(f"当前录入：{selected_group} - {month_str}")
+            cols = st.columns(3)
+            input_values = {}
+            
+            for i, tag in enumerate(tag_names):
+                col = cols[i % 3]
+                with col:
+                    input_values[tag] = st.number_input(
+                        tag, 
+                        value=float(data_map.get(tag, 0.0)), 
+                        step=100.0,
+                        format="%.2f",
+                        key=f"perf_{month_str}_{tag}"
+                    )
+            
+            st.write("")
+            new_note = st.text_area("📝 月度复盘 / 备注", value=note_val, height=80, placeholder="本月总结...")
+            
+            if st.form_submit_button("💾 保存 / 更新", type="primary", use_container_width=True):
+                try:
+                    for tag, amt in input_values.items():
+                        conn.execute('''
+                            INSERT INTO monthly_profits (user_id, month, tag_group, tag_name, amount, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(user_id, month, tag_group, tag_name) 
+                            DO UPDATE SET amount=excluded.amount, updated_at=excluded.updated_at
+                        ''', (user_id, month_str, selected_group, tag, amt, datetime.now()))
+                    
+                    if new_note.strip():
+                        conn.execute('''
+                            INSERT INTO monthly_reviews (user_id, month, tag_group, content, updated_at)
+                            VALUES (?, ?, ?, ?, ?)
+                            ON CONFLICT(user_id, month, tag_group)
+                            DO UPDATE SET content=excluded.content, updated_at=excluded.updated_at
+                        ''', (user_id, month_str, selected_group, new_note, datetime.now()))
+                    else:
+                        conn.execute('DELETE FROM monthly_reviews WHERE user_id=? AND month=? AND tag_group=?', 
+                                   (user_id, month_str, selected_group))
+
+                    conn.commit()
+                    st.toast(f"✅ {month_str} 数据已保存！", icon="💾")
+                    import time
+                    time.sleep(0.5)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"保存失败: {e}")
+
+    # --- 3. 战绩墙 (纯视觉卡片) ---
+    df_all = pd.read_sql('''
+        SELECT month, amount
+        FROM monthly_profits 
+        WHERE user_id = ? AND tag_group = ?
+        ORDER BY month DESC
+    ''', conn, params=(user_id, selected_group))
+    
+    # 因为 monthly_profits 是细分到 tag 的，我们需要先按 month 聚合总金额
+    if df_all.empty:
+        st.info(f"🏷️ 标签组【{selected_group}】暂无收益记录。")
+    else:
+        # 按月聚合
+        df_agg = df_all.groupby('month')['amount'].sum().reset_index().sort_values('month', ascending=False)
+        df_agg['year'] = df_agg['month'].str.slice(0, 4)
+        
+        unique_years = sorted(df_agg['year'].unique().tolist(), reverse=True)
+        
+        tabs = st.tabs([f"{y} 年度" for y in unique_years])
+        
+        for i, year in enumerate(unique_years):
+            with tabs[i]:
+                df_year = df_agg[df_agg['year'] == year]
+                
+                # A. 顶部统计
+                total_profit = df_year['amount'].sum()
+                
+                k1, k2, k3 = st.columns(3)
+                k1.metric("年度累计收益", f"¥{total_profit:,.2f}", delta_color="normal" if total_profit >= 0 else "inverse")
+                k2.metric("盈利月份", f"{len(df_year[df_year['amount']>0])} 个")
+                k3.metric("亏损月份", f"{len(df_year[df_year['amount']<0])} 个")
+                
+                st.divider()
+
+                # B. 月份色块矩阵
+                # 改为 6 列，让卡片看起来更窄
+                grid_cols = st.columns(6)
+                
+                for idx, row in enumerate(df_year.to_dict('records')):
+                    m_str = row['month']
+                    m_total = row['amount']
+                    
+                    # 颜色定义 (A股配色：红涨绿跌)
+                    # 使用柔和一点的色值，防止刺眼
+                    # 红: #e74c3c (Alizarin), 绿: #2ecc71 (Emerald), 灰: #95a5a6
+                    if m_total > 0:
+                        bg_color = "#e74c3c" 
+                        sign = "+"
+                    elif m_total < 0:
+                        bg_color = "#2ecc71" # 如果你习惯美股配色(绿涨红跌)，这里互换颜色即可
+                        sign = ""
+                    else:
+                        bg_color = "#95a5a6"
+                        sign = ""
+
+                    col_idx = idx % 6
+                    
+                    with grid_cols[col_idx]:
+                        # 使用 HTML/CSS 绘制卡片
+                        # height: 80px 加上 narrow column 实现了"高窄"视觉
+                        card_html = f"""
+                        <div style="
+                            background-color: {bg_color};
+                            color: white;
+                            padding: 10px 2px;
+                            border-radius: 6px;
+                            text-align: center;
+                            margin-bottom: 10px;
+                            height: 90px;
+                            display: flex;
+                            flex-direction: column;
+                            justify-content: center;
+                            align-items: center;
+                            box-shadow: 2px 2px 5px rgba(0,0,0,0.1);
+                        ">
+                            <div style="font-size: 0.85em; opacity: 0.9; margin-bottom: 4px;">{m_str}</div>
+                            <div style="font-size: 1.1em; font-weight: bold;">{sign}{m_total:,.0f}</div>
+                        </div>
+                        """
+                        st.markdown(card_html, unsafe_allow_html=True)
 
     conn.close()
 
@@ -2505,9 +2780,13 @@ def send_email_backup(filepath, settings):
 
 def generate_and_send_ai_prompt(user_id, target_group, start_date_str, end_date_str):
     """
-    生成 AI 顾问提示词 (基于日期范围)
+    生成 AI 顾问提示词 (CIO 宏观视角版)
     """
     import pandas as pd
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    
     conn = get_db_connection()
     
     # --- 1. 获取系统设置 ---
@@ -2517,7 +2796,7 @@ def generate_and_send_ai_prompt(user_id, target_group, start_date_str, end_date_
         return False, "未配置邮箱 SMTP，无法发送。"
 
     # --- 2. 搜集核心数据 ---
-    df_assets, df_tags = process_analytics_data(conn, user_id)
+    df_assets, df_tags = get_cached_analytics_data(user_id)
     
     if df_assets is None or df_assets.empty:
         conn.close()
@@ -2527,7 +2806,7 @@ def generate_and_send_ai_prompt(user_id, target_group, start_date_str, end_date_
     start_date = pd.to_datetime(start_date_str)
     end_date = pd.to_datetime(end_date_str)
 
-    # A. 总体概况
+    # A. 总体概况 & 总资产计算
     daily_total = df_assets.groupby('date')[['amount', 'profit', 'cost']].sum().reset_index().sort_values('date')
     
     # 获取 起点(Start) 和 终点(End) 的数据
@@ -2538,24 +2817,22 @@ def generate_and_send_ai_prompt(user_id, target_group, start_date_str, end_date_
         conn.close()
         return False, f"找不到结束日期 {end_date_str} 的资产数据。"
     
-    # 如果起点没数据，就尝试找起点之后最近的一天，或者置空
+    # 处理起点数据
     if row_start_df.empty:
-        # 简单处理：如果没有确切的开始日期，就无法计算精确变化
-        row_start = None
+        start_total_asset = 0.0
     else:
         row_start = row_start_df.iloc[0]
+        start_total_asset = row_start['amount']
         
     row_end = row_end_df.iloc[0]
-
-    # 计算区间变化
-    period_change = 0
-    period_change_pct = 0.0
-    if row_start is not None:
-        period_change = row_end['amount'] - row_start['amount']
-        period_change_pct = (period_change / row_start['amount']) * 100 if row_start['amount'] != 0 else 0
+    end_total_asset = row_end['amount']
+    end_total_profit = row_end['profit']
+    
+    # 计算期间收益率
+    period_change_val = end_total_asset - start_total_asset
+    period_yield_pct = (period_change_val / start_total_asset * 100) if start_total_asset > 0 else 0.0
 
     # B. 风险指标 (计算区间内的最大回撤)
-    # 只取区间内的数据来算
     period_slice = daily_total[(daily_total['date'] >= start_date) & (daily_total['date'] <= end_date)].copy()
     if not period_slice.empty:
         period_slice['rolling_max'] = period_slice['amount'].cummax()
@@ -2564,63 +2841,116 @@ def generate_and_send_ai_prompt(user_id, target_group, start_date_str, end_date_
     else:
         max_mdd = 0.0
         
-    # 当前回撤 (相对于历史最高)
-    # 这通常需要看截止到 end_date 的全历史
+    # 当前回撤 (相对于全历史最高)
     history_slice = daily_total[daily_total['date'] <= end_date].copy()
     history_slice['rolling_max'] = history_slice['amount'].cummax()
     current_dd = ((history_slice.iloc[-1]['amount'] - history_slice['rolling_max'].max()) / history_slice['rolling_max'].max()) * 100
 
-    # C. 持仓结构 (Top 5 资产 - 终点日期)
+    # --- C. 核心持仓结构 (占比 > 0.5%) ---
     target_assets = df_assets[df_assets['date'] == end_date].copy()
     target_assets = target_assets.sort_values('amount', ascending=False)
     
-    top_5_str = ""
-    for i, row in target_assets.head(5).iterrows():
-        currency_info = f" ({row['currency']})" if 'currency' in row and row['currency'] != 'CNY' else ""
-        top_5_str += f"- {row['name']}{currency_info}: ¥{row['amount']:,.0f} (占比 {(row['amount']/row_end['amount']*100):.1f}%)\n"
-
-    # D. 标签分布 (终点日期 & 用户指定的 target_group)
-    alloc_str = ""
-    if df_tags is not None and not df_tags.empty:
-        target_tags = df_tags[df_tags['date'] == end_date]
-        group_data = target_tags[target_tags['tag_group'] == target_group].sort_values('amount', ascending=False)
-        
-        if group_data.empty:
-             alloc_str = "(该标签组下暂无数据)"
-        else:
-            for i, row in group_data.iterrows():
-                alloc_str += f"- {row['tag_name']}: {(row['amount']/row_end['amount']*100):.1f}%\n"
+    # 计算占比
+    target_assets['ratio'] = target_assets['amount'] / end_total_asset
+    
+    # 筛选 > 0.5% 的资产
+    significant_assets = target_assets[target_assets['ratio'] > 0.005]
+    
+    holdings_str = ""
+    if significant_assets.empty:
+        holdings_str = "无单一资产占比超过 0.5%。"
     else:
-        alloc_str = "(暂无标签数据)"
+        for i, row in significant_assets.iterrows():
+            currency_info = f" ({row['currency']})" if 'currency' in row and row['currency'] != 'CNY' else ""
+            holdings_str += f"- {row['name']}{currency_info}: ¥{row['amount']:,.0f} (占比 {row['ratio']*100:.2f}%)\n"
+
+    # --- D. 维度配置变化复盘 (Start vs End) ---
+    analysis_str = ""
+    if df_tags is not None and not df_tags.empty:
+        tags_start = df_tags[(df_tags['date'] == start_date) & (df_tags['tag_group'] == target_group)].copy()
+        tags_end = df_tags[(df_tags['date'] == end_date) & (df_tags['tag_group'] == target_group)].copy()
+        
+        if tags_end.empty and tags_start.empty:
+            analysis_str = f"(该标签组 '{target_group}' 在起止日期均无数据)"
+        else:
+            tags_start = tags_start[['tag_name', 'amount', 'profit']].rename(columns={'amount': 's_amt', 'profit': 's_prof'})
+            tags_end = tags_end[['tag_name', 'amount', 'profit']].rename(columns={'amount': 'e_amt', 'profit': 'e_prof'})
+            
+            df_compare = pd.merge(tags_end, tags_start, on='tag_name', how='outer').fillna(0)
+            
+            df_compare['s_ratio'] = (df_compare['s_amt'] / start_total_asset * 100) if start_total_asset > 0 else 0.0
+            df_compare['e_ratio'] = (df_compare['e_amt'] / end_total_asset * 100) if end_total_asset > 0 else 0.0
+            
+            df_compare = df_compare.sort_values('e_amt', ascending=False)
+            
+            analysis_str += f"基于【{target_group}】维度的变化对比：\n"
+            for _, row in df_compare.iterrows():
+                # 过滤极小额
+                if row['s_amt'] < 100 and row['e_amt'] < 100: continue
+                    
+                tag_name = row['tag_name']
+                analysis_str += (
+                    f"- **{tag_name}**:\n"
+                    f"  - 配置比例: {row['s_ratio']:.1f}% ➡️ {row['e_ratio']:.1f}%\n"
+                    f"  - 持有资金: ¥{row['s_amt']:,.0f} ➡️ ¥{row['e_amt']:,.0f}\n"
+                    f"  - 持有收益: ¥{row['s_prof']:,.0f} ➡️ ¥{row['e_prof']:,.0f}\n"
+                )
+    else:
+        analysis_str = "(暂无标签数据，无法进行维度分析)"
 
     conn.close()
 
-    # --- 3. 组装 Prompt 模板 ---
+    # --- 3. 组装 Prompt 模板 (CIO 级强化版) ---
     prompt_content = f"""
-===== 复制以下内容发送给 AI =====
+===== 请将以下内容完整发送给 AI (如 ChatGPT/Claude) =====
 
-【角色设定】
-你是一位专业的私人财富管理顾问。
-**复盘周期：{start_date_str} 至 {end_date_str}**
+# Role / 角色设定
+**你是一位拥有华尔街顶级投行背景的首席投资官 (CIO)。**
+你精通全球宏观经济分析、大类资产配置策略（如耶鲁模式、全天候策略）以及行为金融学。你不仅关注账户的绝对数字，更擅长将个人投资组合的表现置于宏观市场背景下进行“归因分析”。你的分析风格是：客观、犀利、数据驱动，并能给出可落地的战术建议。
 
-以下是该周期的资产组合变动数据（已折算为人民币 CNY）：
+# Context / 复盘背景
+- **复盘周期**：{start_date_str} 至 {end_date_str}
+- **用户画像**：中国投资者，以人民币计价，关注全球资产配置。
 
-1. 核心变动：
-   - 期末总净值：¥{row_end['amount']:,.0f}
-   - 期间净值变动：¥{period_change:+,.0f} ({period_change_pct:+.2f}%)
-   - 期间累计收益：¥{row_end['profit']:,.0f} (截至期末)
-   - 期间最大回撤：{max_mdd:.2f}%
-   - 当前距离历史高点回撤：{current_dd:.2f}%
+# Internal Data / 内部投资组合数据
 
-2. 期末前五大持仓：
-{top_5_str}
-3. 期末资产配置比例 (基于 "{target_group}" 分类)：
-{alloc_str}
+## 1. 资金面概况
+- **期初总资产**：¥{start_total_asset:,.0f}
+- **期末总资产**：¥{end_total_asset:,.0f}
+- **期间净值增长率**：{period_yield_pct:+.2f}% (变动金额: ¥{period_change_val:+,.0f})
+- **期末累计持有收益**：¥{end_total_profit:,.0f}
 
-【分析任务】
-1. **周期复盘**：针对这期间 {period_change_pct:+.2f}% 的变动，结合宏观环境分析可能的成因。
-2. **风险评估**：当前 {current_dd:.2f}% 的回撤水平是否健康？
-3. **优化建议**：基于期末的持仓结构，下一阶段应如何调整？
+## 2. 风险水位
+- **周期内最大回撤**：{max_mdd:.2f}%
+- **当前距离历史高点回撤**：{current_dd:.2f}%
+
+## 3. 核心持仓 (占比 > 0.5%)
+{holdings_str}
+
+## 4. 结构演变 (维度：{target_group})
+{analysis_str}
+
+---
+
+# Action Required / 你的任务
+请务必执行以下步骤进行分析：
+
+## 第一步：外部市场环境扫描 (必须联网搜索)
+请利用你的联网能力，**查询 {start_date_str} 至 {end_date_str} 期间的以下市场数据**，作为分析的基准锚点：
+1.  **关键指数表现**：纳斯达克100 (NDX)、标普500 (SPX)、沪深300 (CSI300)、黄金 (Gold)。
+2.  **核心宏观事件**：期间是否有美联储议息、重大地缘政治事件、或科技巨头(如 NVDA/AAPL)的财报发布？
+
+## 第二步：深度归因分析
+基于查询到的外部数据和上述内部数据，回答以下两个问题：
+
+### 1. 风险评估 (Risk Assessment)
+- 将用户的**最大回撤** ({max_mdd:.2f}%) 与同期**纳斯达克**和**标普500**的最大回撤进行对比。用户的风控能力是跑赢了市场还是跑输了？
+- 结合持仓明细，指出当前组合中最大的**风险敞口**在哪里？（例如：是否过度集中于科技股？是否存在汇率风险？）
+
+### 2. 持仓合理性分析与建议 (Allocation Analysis & Advice)
+- **业绩归因**：用户的资产增长 ({period_yield_pct:+.2f}%) 主要得益于哪些资产的 Beta (市场上涨)，还是用户的 Alpha (主动调仓)？
+- **结构评价**：观察“结构演变”数据，用户在周期内的加减仓操作（资金量变化）是否踩准了宏观节奏？
+- **战术建议**：基于期末持仓和当前的宏观环境，给出具体的**再平衡建议**（哪些板块该止盈？哪些该抄底？现金比例是否合适？）。
 
 ================================
     """
@@ -2628,11 +2958,11 @@ def generate_and_send_ai_prompt(user_id, target_group, start_date_str, end_date_
     # --- 4. 发送邮件 ---
     try:
         msg = MIMEMultipart()
-        msg['Subject'] = f'🤖 AI 复盘 ({start_date_str} ~ {end_date_str})'
+        msg['Subject'] = f'🤖 AI 宏观对冲复盘 ({start_date_str} ~ {end_date_str})'
         msg['From'] = settings['email_user']
         msg['To'] = settings['email_to'] if settings['email_to'] else settings['email_user']
         
-        body = "这是为您自动生成的 AI 复盘提示词。\n\n" + prompt_content
+        body = "这是为您自动生成的 CIO 级深度复盘提示词。\n\n" + prompt_content
         msg.attach(MIMEText(body, 'plain'))
 
         server = smtplib.SMTP_SSL(settings['email_host'], settings['email_port'])
@@ -2640,7 +2970,7 @@ def generate_and_send_ai_prompt(user_id, target_group, start_date_str, end_date_
         server.send_message(msg)
         server.quit()
         
-        return True, f"已发送 {start_date_str} 至 {end_date_str} 的分析提示词！"
+        return True, f"已发送 {start_date_str} 至 {end_date_str} 的深度分析提示词！"
     except Exception as e:
         return False, f"邮件发送失败: {str(e)}"
 
@@ -2923,6 +3253,16 @@ def main():
     else:
         # === 已登录状态：侧边栏导航 ===
         with st.sidebar:
+            # --- 🔥 新增：Logo 图片展示区 ---
+            # 直接复用之前定义的图片文件名
+            LOGO_FILE = 'logo.png' 
+            if os.path.exists(LOGO_FILE):
+                # width 参数控制图片大小，100-150 左右比较合适侧边栏
+                st.image(LOGO_FILE, width=200) 
+            
+            # 稍微加一点点空隙
+            st.write("")
+
             # A. 用户信息区 (独占一行，大标题)
             # 使用 subheader 让名字显眼，但不像 title 那么占地
             st.subheader(t('sidebar_welcome').format(st.session_state.user['username']))
@@ -2946,6 +3286,7 @@ def main():
             nav_keys = [
                 "nav_dashboard", 
                 "nav_cashflow",  # 👈 新增菜单项
+                "nav_performance",
                 "nav_notes", 
                 "nav_assets", 
                 "nav_entry", 
@@ -2961,6 +3302,14 @@ def main():
             selected_index = nav_labels.index(selected_label)
             selected_key = nav_keys[selected_index]
             
+            # 👇👇👇 在 退出登录 按钮之前，加上这个 👇👇👇
+            if IS_RASPBERRY_PI:
+                st.divider()
+                if st.button("🔄 强制刷新数据", help="树莓派模式下：如果你更新了底层数据库文件，点此清除缓存"):
+                    st.cache_data.clear()
+                    st.toast("缓存已清除，正在重新加载...", icon="🚀")
+                    st.rerun()
+
             # D. 退出按钮
             st.divider()
             if st.button(t("btn_logout"), use_container_width=True):
@@ -2973,6 +3322,8 @@ def main():
             page_dashboard()
         elif selected_key == "nav_cashflow": # 👈 新增路由
             page_cashflow()
+        elif selected_key == "nav_performance": # 👈 新增
+            page_performance()
         elif selected_key == "nav_notes":
             page_investment_notes()
         elif selected_key == "nav_assets":

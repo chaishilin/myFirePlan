@@ -170,6 +170,36 @@ def init_db():
     )
     ''')
 
+    # 12. 月度收益明细表 (支持按标签组隔离)
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS monthly_profits (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        month TEXT NOT NULL,       -- 格式 '2025-01'
+        tag_group TEXT NOT NULL,   -- 核心隔离字段 (如 '资金渠道')
+        tag_name TEXT NOT NULL,    -- 标签名 (如 '支付宝')
+        amount REAL NOT NULL,      -- 收益金额
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, month, tag_group, tag_name)
+    )
+    ''')
+
+    # 13. 月度复盘笔记表 (支持按标签组隔离)
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS monthly_reviews (
+        review_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        month TEXT NOT NULL,       -- 格式 '2025-01'
+        tag_group TEXT NOT NULL,   -- 核心隔离字段
+        content TEXT,              -- 复盘文字
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, month, tag_group)
+    )
+    ''')
+    
+    # 打印提示，方便确认
+    print("✅ 已更新数据库结构：增加 monthly_profits 和 monthly_reviews 表")
+
     conn.commit()
     conn.close()
     print("✅ 数据库结构初始化完成 (含最新字段：is_cleared, currency, remarks 及汇率表)")
