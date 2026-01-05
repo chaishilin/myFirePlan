@@ -1,6 +1,4 @@
-# 📈 My FIRE plan (个人资产管理系统)
-![logo](/logo.png "logo")
-
+# <img src="logo.png" width="60" align="center" /> My FIRE plan (个人资产管理系统) 
 
 一个专为 FIRE (Financial Independence, Retire Early) 追求者打造的**极简个人资产管理系统**。
 
