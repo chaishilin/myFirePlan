@@ -3177,10 +3177,19 @@ def main():
         selected_label = st.radio("功能菜单", list(nav_map.keys()))
         selected_key = nav_map[selected_label]
         
+        # --- 在 main() 函数内部，侧边栏逻辑之后 ---
+
+        # 如果是 demo 账号，显示全局警告
+        if 'user' in st.session_state and st.session_state.user and st.session_state.user['username'] == 'demo':
+            st.warning("⚠️ **演示模式 (Demo Mode)**：当前展示数据均为 AI 随机生成的虚拟样本，仅供功能演示，非真实资产。", icon="🤖")
+            # 甚至可以搞个侧边栏的气泡
+            st.sidebar.info("当前处于 Demo 演示模式")
+
         if IS_RASPBERRY_PI:
             st.divider()
             if st.button("🔄 强制刷新数据"):
                 st.cache_data.clear()
+                st.toast("缓存已清除，正在重新加载...", icon="🚀")
                 st.rerun()
 
     # === 页面路由分发 (保持不变) ===
