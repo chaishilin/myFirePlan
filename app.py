@@ -1543,10 +1543,7 @@ def page_dashboard():
 
             # 绘图
             custom_data_cols = ['amt_w', 'prof_w', 'cost_w', 'yield_rate', 'share']
-            if metric_type.startswith("占比"):
-                fig = px.area(plot_df, x='date', y=y_col, color=color_col, groupnorm='percent', custom_data=custom_data_cols)
-            else:
-                fig = px.line(plot_df, x='date', y=y_col, color=color_col, markers=True, custom_data=custom_data_cols)
+            fig = px.line(plot_df, x='date', y=y_col, color=color_col, markers=True, custom_data=custom_data_cols)
             
             # 定制 tooltip
             hover_html = f"<b>%{{fullData.name}}</b>: <b>{metric_type.split(' ')[0]}:%{{y:.2f}}{y_unit}</b>"
