@@ -35,7 +35,6 @@ conn = get_db_connection()
 
 try:
     # --- 1. 获取所有有数据的日期 (用于智能推断默认时间) ---
-    # 我们查 my_fund_history 表，因为这是生成报告的数据源
     df_dates = pd.read_sql('SELECT DISTINCT date FROM my_fund_history WHERE user_id = ? ORDER BY date', conn, params=(user_id,))
     
     if df_dates.empty:
@@ -70,51 +69,46 @@ try:
     # ==========================================
     with st.container(border=True):
         st.subheader("🛠️ 生成配置")
-        
         c1, c2 = st.columns(2)
-        
         with c1:
-            date_range = st.date_input(
-                "1. 选择复盘时间段",
-                value=(default_start, latest_date), 
-                max_value=latest_date,
-                help="默认选中最近一次快照的一周前（自动修正为有效日期）"
-            )
-        
+            date_range = st.date_input("1. 选择复盘时间段", value=(default_start, latest_date), max_value=latest_date)
         with c2:
-            # 获取所有标签组
             all_groups = pd.read_sql("SELECT DISTINCT tag_group FROM tags WHERE user_id = ?", conn, params=(user_id,))
             group_opts = ["按具体资产"] + all_groups['tag_group'].tolist()
-            
-            selected_dim = st.selectbox(
-                "2. 选择结构分析维度", 
-                group_opts,
-                index=0,
-                help="AI 将对比期初和期末，该维度下各分类的资金占比变化。"
-            )
+            selected_dim = st.selectbox("2. 选择结构分析维度", group_opts, index=0)
 
-        st.info("💡 **提示**：系统将提取选中时间段内的**每日净值走势**、**期初/期末持仓结构对比**以及**期末核心持仓明细**，组合成专业的 Prompt 发送到你的邮箱。")
+        st.info("💡 **提示**：系统将提取每日净值走势、结构对比及核心持仓，组合成 Prompt 发送至邮箱。")
         
         if st.button("🚀 生成并发送 AI Prompt 到邮箱", type="primary"):
-            # 校验日期
             if isinstance(date_range, tuple) and len(date_range) == 2:
                 start_d, end_d = date_range
                 
-                # 基础逻辑校验
                 if start_d >= end_d:
                     st.error("开始日期必须早于结束日期。")
                 else:
-                    # 开始生成
                     with st.spinner("正在提取每日数据、计算结构变化、组装 Prompt..."):
                         s_str = start_d.strftime('%Y-%m-%d')
                         e_str = end_d.strftime('%Y-%m-%d')
                         
-                        # 调用 utils 里的生成函数
-                        success, msg = generate_and_send_ai_prompt(user_id, s_str, e_str, selected_dim)
+                        # 调用 utils
+                        success, msg, content = generate_and_send_ai_prompt(user_id, s_str, e_str, selected_dim)
                         
                         if success:
-                            st.success(f"✅ {msg}")
                             st.balloons()
+                            st.success(f"✅ {msg}")
+                            
+                            st.divider()
+                            
+                            # 🔥 修改点 1：直接渲染 Markdown (所见即所得，表格会很好看)
+                            st.subheader("📖 提示词内容预览")
+                            with st.container(border=True):
+                                st.markdown(content)
+                            
+                            # 🔥 修改点 2：提供折叠的一键复制区
+                            st.caption("👇 需要复制？请展开下方区域")
+                            with st.expander("📋 点击复制完整 Prompt (Raw Markdown)"):
+                                st.code(content, language="markdown")
+                                
                         else:
                             st.error(f"❌ {msg}")
             else:

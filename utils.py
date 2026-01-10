@@ -489,10 +489,13 @@ def generate_and_send_ai_prompt(user_id, start_date_str, end_date_str, dimension
         if df_trend.empty:
             return False, f"该时间段 ({start_date_str} ~ {end_date_str}) 内没有生成过净值历史数据，请先确保已进行过数据录入和重算。"
         
-        # 将每日数据转换为 CSV 格式字符串，方便 AI 读取
-        # 为了节省 token，保留 2 位小数
-        csv_trend_str = df_trend.to_csv(index=False, float_format='%.4f')
-
+        # 手动构建 Markdown 表格 (日期 | 总资产 | 累计收益 | 单位净值)
+        trend_lines = ["| 日期 | 总资产 | 累计收益 | 单位净值 |"]
+        trend_lines.append("|---|---|---|---|")
+        for _, r in df_trend.iterrows():
+            trend_lines.append(f"| {r['date']} | {r['total_assets']:.2f} | {r['accumulated_profit']:.2f} | {r['unit_nav']:.4f} |")
+        markdown_trend_str = "\n".join(trend_lines)
+        
         # --- 3. 准备期初 vs 期末 结构对比 (Structure Comparison) ---
         # 根据用户选择的维度 (dimension_group) 获取数据
         # 我们利用 get_cached_analytics_data 获取快照数据
@@ -562,26 +565,23 @@ def generate_and_send_ai_prompt(user_id, start_date_str, end_date_str, dimension
         else:
             df_end_assets = df_assets_all[mask_end].copy()
             total_end_val = df_end_assets['amount'].sum()
-            
-            # 计算占比
             df_end_assets['ratio'] = df_end_assets['amount'] / total_end_val
-            # 筛选 > 0.5%
             key_assets = df_end_assets[df_end_assets['ratio'] > 0.005].sort_values('amount', ascending=False)
             
-            lines = []
-            lines.append(f"当前总资产: {total_end_val:,.2f}")
-            lines.append("占比超过 0.5% 的核心资产列表：")
+            # Markdown 表头
+            lines = [f"当前总资产: **{total_end_val:,.2f}**\n"]
+            lines.append("| 资产名称 | 币种 | 金额 | 占比 | 状态 |")
+            lines.append("|---|---|---|---|---|")
+            
             for _, row in key_assets.iterrows():
-                curr_txt = f"({row['currency']})" if row['currency'] != 'CNY' else ""
+                curr = row['currency'] if row['currency'] != 'CNY' else ""
                 profit_txt = f"浮盈 {row['profit']:,.0f}" if row['profit'] > 0 else f"浮亏 {row['profit']:,.0f}"
-                lines.append(f"- **{row['name']}**{curr_txt}: ¥{row['amount']:,.0f} (占比 {row['ratio']*100:.2f}%) | {profit_txt}")
+                lines.append(f"| **{row['name']}** | {curr} | {row['amount']:,.0f} | {row['ratio']*100:.2f}% | {profit_txt} |")
             
             top_holdings_str = "\n".join(lines)
 
         # --- 5. 组装 Prompt (Prompt Engineering) ---
         prompt_content = f"""
-===== AI 投资顾问提示词 (请复制以下内容发送给 ChatGPT/Claude) =====
-
 # Role / 角色设定
 **你是一位拥有 20 年经验的专业基金投资顾问 (CIO 级别)。**
 你的专长是基于详实的数据，对个人投资者的投资组合进行**归因分析**、**风险评估**和**策略建议**。
@@ -593,12 +593,9 @@ def generate_and_send_ai_prompt(user_id, start_date_str, end_date_str, dimension
 
 # Data Section / 投资组合数据
 
-## 1. 每日净值与收益趋势 (Daily Trend CSV)
-*数据列说明: Date(日期), TotalAssets(总资产), AccumulatedProfit(累计持有收益), UnitNav(单位净值)*
-```csv
-{csv_trend_str}
-
-```
+## 1. 每日净值与收益趋势 (Daily Trend)
+个人投资者的全部资产已经净值化
+{markdown_trend_str}
 
 ## 2. 结构变化对比 (Structure Change)
 
@@ -629,7 +626,6 @@ def generate_and_send_ai_prompt(user_id, start_date_str, end_date_str, dimension
 
 1. 基于当前的宏观环境和我的持仓结构，给出 1-3 条具体的调整建议（如：是否需要增加债券对冲？是否需要止盈某类资产？）。
 
-================================
 """
         # --- 6. 发送邮件 ---
         msg = MIMEMultipart()
@@ -645,7 +641,7 @@ def generate_and_send_ai_prompt(user_id, start_date_str, end_date_str, dimension
         server.send_message(msg)
         server.quit()
         
-        return True, "Prompt 已发送至邮箱！"
+        return True, "Prompt 已发送至邮箱！",prompt_content
 
     except Exception as e:
         import traceback
