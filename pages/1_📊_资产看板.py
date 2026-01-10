@@ -10,7 +10,9 @@ from utils import (
     get_db_connection, 
     get_cached_analytics_data, 
     get_market_index_data_cached, 
-    show_sidebar_user_picker
+    show_sidebar_user_picker,
+    get_user_notice,    # 新增
+    update_user_notice  # 新增
 )
 
 # ==========================================
@@ -26,16 +28,76 @@ if "user" not in st.session_state or not st.session_state.user:
 
 # 渲染侧边栏 (用户切换、Demo提示等)
 show_sidebar_user_picker()
-
+        
 # ==========================================
 # 1. 页面主逻辑
 # ==========================================
 
-st.header("📊 长流基金-资产看板")
+st.header("📊 资产看板")
 user_id = st.session_state.user['user_id']
 conn = get_db_connection()
 
 try:
+    # ==========================================
+    # 🔥 个人基金公告栏 (原地编辑模式)
+    # ==========================================
+    
+    # 1. 获取当前公告
+    current_notice = get_user_notice(user_id)
+    
+    # 2. 初始化编辑状态
+    if 'dash_notice_editing' not in st.session_state:
+        st.session_state.dash_notice_editing = False
+
+    # 3. 根据状态渲染不同 UI
+    if st.session_state.dash_notice_editing:
+        # === ✏️ 编辑模式 (原地变成输入框) ===
+        with st.container(border=True):
+            st.caption("编辑你的投资宣言 (支持 Markdown)")
+            # 这是一个 Form，防止每输入一个字就刷新
+            with st.form("notice_edit_form"):
+                new_text = st.text_area(
+                    "Content", 
+                    value=current_notice, 
+                    height=200, 
+                    label_visibility="collapsed",
+                    placeholder="写点什么..."
+                )
+                
+                b1, b2 = st.columns([1, 6])
+                with b1:
+                    submitted = st.form_submit_button("💾 保存", type="primary", use_container_width=True)
+                with b2:
+                    canceled = st.form_submit_button("❌ 取消")
+                
+                if submitted:
+                    update_user_notice(user_id, new_text)
+                    st.session_state.dash_notice_editing = False
+                    st.rerun()
+                
+                if canceled:
+                    st.session_state.dash_notice_editing = False
+                    st.rerun()
+
+    else:
+        # === 👁️ 展示模式 (显示 info 框) ===
+        display_text = current_notice if current_notice else "暂无公告，点击右侧铅笔图标编辑..."
+        
+        # 布局：左边是大框，右边是小按钮
+        col_text, col_btn = st.columns([0.94, 0.06])
+        
+        with col_text:
+            st.info(f"{display_text}")
+        
+        with col_btn:
+            # 这里的 vertical_alignment 是为了让按钮不跑偏 (Streamlit 1.37+)
+            # 如果你的版本较低报错，可以去掉 vertical_alignment 参数
+            if st.button("✏️", help="编辑公告", key="btn_edit_mode"):
+                st.session_state.dash_notice_editing = True
+                st.rerun()
+
+    st.divider()
+    
     # ==========================================
     # 2. 顶部核心指标 (KPIs)
     # ==========================================
@@ -43,11 +105,23 @@ try:
     
     if not df_fund.empty:
         df_fund['date'] = pd.to_datetime(df_fund['date'])
+        
+        # 🔥 新增逻辑：计算单位持仓成本 (Unit Cost)
+        # 单位成本 = 总本金 / 总份额
+        # 做了除零保护，如果份额为0，成本视为1.0（初始状态）
+        df_fund['unit_cost'] = df_fund.apply(
+            lambda x: (x['principal'] / x['total_shares']) if x['total_shares'] > 0.001 else 1.0, 
+            axis=1
+        )
+
         latest = df_fund.iloc[-1]
         
         # 计算累计收益率 (百分比)
         total_ret_pct = (latest['unit_nav'] - 1.0) * 100
         
+        # 计算当前单位成本
+        current_unit_cost = latest['unit_cost']
+
         # 布局改为 5 列
         k1, k2, k3, k4, k5 = st.columns(5)
         
@@ -61,22 +135,19 @@ try:
                       delta=f"{latest['daily_return']*100:.2f}% (最新)", 
                       delta_color="normal")
         with k4:
-            st.metric("累计收益率", f"{total_ret_pct:.2f}%", 
-                      help="单位净值相对于 1.0 的涨幅")
+            st.metric("单位持仓成本", f"{current_unit_cost:.4f}", 
+                      delta=f"{(latest['unit_nav'] - current_unit_cost)/current_unit_cost*100:.1f}% (安全垫)",
+                      help="总本金 / 总份额。如果净值高于此线，说明盈利。")
+        
         with k5:
-            # 兼容旧数据：如果没有 drawdown 字段，做个防错
             dd_val = latest['drawdown'] if 'drawdown' in latest else 0.0
-            # 如果是整个序列
             min_dd = df_fund['drawdown'].min() if 'drawdown' in df_fund.columns else 0.0
-            
-            st.metric("历史最大回撤", f"{min_dd*100:.2f}%", 
-                      delta_color="inverse")
+            st.metric("历史最大回撤", f"{min_dd*100:.2f}%", delta_color="inverse")
         
         st.divider()
     else:
         st.info("⏳ 暂无基金净值数据，请先去【数据录入】保存一次快照，并等待后台计算。")
         st.stop()
-    
     # ==========================================
     # 3. 准备详细资产数据 (缓存加速)
     # ==========================================
@@ -111,14 +182,10 @@ try:
             if df_slice.empty:
                 st.warning("所选周期内无数据")
             else:
-                # 定义通用的 X 轴样式配置
                 common_xaxis_config = dict(
                     title="日期",
-                    tickformat="%Y年%m月%d日", 
-                    tickmode='array',
-                    tickvals=[df_slice['date'].min(), df_slice['date'].max()], 
-                    tickangle=0,
-                    ticklabelmode='period',
+                    tickformat="%Y-%m-%d", 
+                    tickmode='auto',
                     range=[
                         df_slice['date'].min() - pd.Timedelta(days=1), 
                         df_slice['date'].max() + pd.Timedelta(days=3)
@@ -138,7 +205,7 @@ try:
                         line=dict(width=2, color='#2980B9'),
                         fill='tozeroy',
                         fillcolor='rgba(41, 128, 185, 0.2)',
-                        hovertemplate='日期: %{x|%Y年%m月%d日}<br>总资产: %{y:.2f} 万元<extra></extra>'
+                        hovertemplate='日期: %{x|%Y-%m-%d}<br>总资产: %{y:.2f} 万元<extra></extra>'
                     ))
                     fig_asset.update_layout(
                         hovermode="x unified", height=350, margin=dict(t=10),
@@ -149,9 +216,7 @@ try:
 
                 with c_top2:
                     st.subheader("持有收益变化")
-                    # 兼容性处理：如果没有 accumulated_profit 字段
                     if 'accumulated_profit' not in df_slice.columns:
-                         # 简单的 mock 或计算
                          df_slice['accumulated_profit'] = df_slice['total_assets'] - df_slice.get('principal', 0)
 
                     fig_profit = go.Figure()
@@ -161,7 +226,7 @@ try:
                         line=dict(width=2, color='#E74C3C'), 
                         fill='tozeroy', 
                         fillcolor='rgba(231, 76, 60, 0.2)', 
-                        hovertemplate='日期: %{x|%Y年%m月%d日}<br>持有收益: %{y:,.2f} 元<extra></extra>'
+                        hovertemplate='日期: %{x|%Y-%m-%d}<br>持有收益: %{y:,.2f} 元<extra></extra>'
                     ))
                     fig_profit.update_layout(
                         hovermode="x unified", height=350, margin=dict(t=10),
@@ -172,7 +237,7 @@ try:
 
                 st.divider()
 
-                # === B. 第二排：业绩走势 & 回撤修复 ===
+                # === B. 第二排：业绩走势 (含持仓成本) & 回撤修复 ===
                 
                 nav_start = df_slice.iloc[0]['unit_nav']
                 nav_end = df_slice.iloc[-1]['unit_nav']
@@ -198,21 +263,28 @@ try:
 
                     st.markdown(f"区间涨跌: <span style='color:{return_color}; font-weight:bold; font-size:1.1em'>{return_sign}{period_return*100:.2f}%</span>", unsafe_allow_html=True)
                     
-                    fig_nav = px.line(df_slice, x='date', y='unit_nav', title=None)
-                    
-                    # 1. 个人基金曲线
-                    fig_nav.update_traces(
-                        showlegend=True,
-                        line_color="#0E44E5", line_width=2.5, name='我的净值',
+                    fig_nav = go.Figure()
+
+                    # 1. 个人基金净值曲线
+                    fig_nav.add_trace(go.Scatter(
+                        x=df_slice['date'], y=df_slice['unit_nav'],
+                        mode='lines', name='我的净值',
+                        line=dict(color='#0E44E5', width=2.5),
                         hovertemplate='净值: %{y:.4f}<extra></extra>'
-                    )
+                    ))
+
+                    # 2. 🔥 新增：持仓成本曲线 (Cost Line)
+                    fig_nav.add_trace(go.Scatter(
+                        x=df_slice['date'], y=df_slice['unit_cost'],
+                        mode='lines', name='持仓成本',
+                        line=dict(color='#95A5A6', width=1.5, dash='dash'), # 灰色虚线
+                        hovertemplate='成本: %{y:.4f}<extra></extra>'
+                    ))
                     
-                    # 2. 对比指数曲线 (从 utils 获取缓存数据)
+                    # 3. 对比指数曲线
                     if benchmark_name != "(无)":
                         s_str = df_slice['date'].min().strftime('%Y-%m-%d')
                         e_str = df_slice['date'].max().strftime('%Y-%m-%d')
-                        
-                        # 调用 utils 里的缓存函数
                         df_bench = get_market_index_data_cached(benchmark_name, s_str, e_str)
                         
                         if not df_bench.empty and len(df_bench) > 1:
@@ -229,20 +301,23 @@ try:
                                     y=df_bench['rebased_nav'],
                                     mode='lines',
                                     name=f'{benchmark_name} ({b_sign}{bench_ret*100:.1f}%)',
-                                    line_color="#29BEF0", line_width=2.5, opacity=0.2,
+                                    line=dict(color='#29BEF0', width=2.5), 
+                                    opacity=0.3,
                                     hovertemplate=f'{benchmark_name}: %{{y:.4f}}<extra></extra>'
                                 ))
-                        else:
-                            st.caption(f"⚠️ 暂未获取到 {benchmark_name} 数据")
-
-                    fig_nav.add_hline(y=1.0, line_dash="solid", line_color="#ECF0F1", line_width=1)
-                    
+                                        
                     fig_nav.update_layout(
                         hovermode="x unified", 
                         yaxis_title="单位净值", 
                         height=380, 
                         margin=dict(t=10),
-                        legend=dict(orientation="h", yanchor="top", y=0.1, xanchor="right", x=0.98, bgcolor="rgba(0,0,0,0)"),
+                        # 🔥 修改：图例移动到左上角 (Horizontal, Top-Left)
+                        legend=dict(
+                            orientation="h", 
+                            yanchor="top", y=0.99, 
+                            xanchor="left", x=0.01, 
+                            bgcolor="rgba(0,0,0,0)"
+                        ),
                         xaxis=common_xaxis_config
                     )
                     st.plotly_chart(fig_nav, use_container_width=True)
@@ -250,57 +325,70 @@ try:
                 with c_chart2:
                     st.subheader("回撤修复")
                     
-                    # 现场计算回撤逻辑 (如果数据库里没有存)
+                    # 现场计算回撤逻辑
                     if 'period_dd' not in df_slice.columns:
                         df_slice['rolling_max'] = df_slice['unit_nav'].cummax()
                         df_slice['period_dd'] = (df_slice['unit_nav'] - df_slice['rolling_max']) / df_slice['rolling_max']
                     
                     min_dd_val = df_slice['period_dd'].min()
-                    trough_idx = df_slice['period_dd'].idxmin()
-                    trough_date = df_slice.loc[trough_idx]['date']
-                    trough_nav = df_slice.loc[trough_idx]['unit_nav']
                     
-                    # 修复周期计算
-                    peak_val = df_slice.loc[trough_idx].get('rolling_max', trough_nav) # 简易防错
-                    # 找到坑底之前的那个最高点日期
-                    peak_df = df_slice[(df_slice['date'] <= trough_date) & (df_slice['unit_nav'] >= peak_val)]
-                    peak_date = peak_df.iloc[-1]['date'] if not peak_df.empty else df_slice.iloc[0]['date']
-                    
-                    # 找到坑底之后何时涨回去
-                    recover_df = df_slice[(df_slice['date'] > trough_date) & (df_slice['unit_nav'] >= peak_val)]
-                    repair_status = "未修复"
-                    end_shade_date = df_slice['date'].max()
-                    
-                    if not recover_df.empty:
-                        recover_date = recover_df.iloc[0]['date']
-                        days_used = (recover_date - peak_date).days
-                        repair_status = f"{days_used}天修复"
-                        end_shade_date = recover_date
-                    else:
-                        repair_status = "修复中..."
+                    # 状态计算
+                    repair_status = "修复中..."
+                    if not df_slice.empty:
+                         # 如果当前净值 >= 历史最大净值 (允许极小误差)，则说明已新高
+                        curr_nav = df_slice.iloc[-1]['unit_nav']
+                        hist_max = df_slice['unit_nav'].max()
+                        if curr_nav >= hist_max * 0.9999:
+                            repair_status = "已创新高 🎉"
 
                     st.markdown(f"区间最大回撤: **{min_dd_val*100:.2f}%** | 状态: **{repair_status}**")
 
+                    # 🔥 修改：计算回撤区间 (用于画半透明背景)
+                    trough_idx = df_slice['period_dd'].idxmin()
+                    trough_date = df_slice.loc[trough_idx]['date']
+                    trough_nav = df_slice.loc[trough_idx]['unit_nav']
+                    peak_val_at_trough = df_slice.loc[trough_idx]['rolling_max']
+
+                    # 1. 找起点：跌破前高点的那一天
+                    pre_data = df_slice[df_slice['date'] <= trough_date]
+                    # 往前找最后一个 nav >= peak_val 的点
+                    peak_point = pre_data[pre_data['unit_nav'] >= peak_val_at_trough * 0.9999].iloc[-1]
+                    peak_date = peak_point['date']
+
+                    # 2. 找终点：涨回前高点的那一天 (如果还没涨回去，就选最后一天)
+                    post_data = df_slice[df_slice['date'] > trough_date]
+                    recover_points = post_data[post_data['unit_nav'] >= peak_val_at_trough * 0.9999]
+                    
+                    if not recover_points.empty:
+                        recover_date = recover_points.iloc[0]['date']
+                    else:
+                        recover_date = df_slice.iloc[-1]['date']
+
                     fig_repair = go.Figure()
+                    
+                    # 主曲线：普通的折线 (去掉 fill='tozeroy')
                     fig_repair.add_trace(go.Scatter(
                         x=df_slice['date'], y=df_slice['unit_nav'], 
                         mode='lines', name='净值', 
                         line=dict(color='#2980B9', width=2),
-                        hovertemplate='日期: %{x|%Y年%m月%d日}<br>单位净值: %{y:.4f}<extra></extra>'
+                        hovertemplate='日期: %{x|%Y-%m-%d}<br>单位净值: %{y:.4f}<extra></extra>'
                     ))
                     
                     if abs(min_dd_val) > 0.001:
+                        # 🔥 核心修改：只在受损区间添加半透明背景
                         fig_repair.add_vrect(
-                            x0=peak_date, x1=end_shade_date,
-                            fillcolor="rgba(231, 76, 60, 0.2)", layer="below", line_width=0
+                            x0=peak_date, x1=recover_date,
+                            fillcolor="rgba(231, 76, 60, 0.2)", layer="below", line_width=0,
                         )
+                        
+                        # 标记回撤底点
                         fig_repair.add_trace(go.Scatter(
                             x=[trough_date], y=[trough_nav],
                             mode='markers+text',
-                            text=[f"最大回撤\n{min_dd_val*100:.2f}%"],
+                            text=[f"回撤底\n{min_dd_val*100:.1f}%"],
                             textposition="bottom center",
                             marker=dict(color='red', size=8), showlegend=False,
-                            hovertemplate='日期: %{x|%Y年%m月%d日}<br>最大回撤点: %{y:.4f}<extra></extra>'
+                            hovertemplate='最大回撤点: %{y:.4f}<extra></extra>'
                         ))
 
                     fig_repair.update_layout(
@@ -309,7 +397,6 @@ try:
                         xaxis=common_xaxis_config
                     )
                     st.plotly_chart(fig_repair, use_container_width=True)
-
     # --- Tab 2: 结构对比 ---
     with tab2:
         st.subheader("📊 结构化趋势分析")

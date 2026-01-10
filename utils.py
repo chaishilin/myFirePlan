@@ -649,7 +649,34 @@ def generate_and_send_ai_prompt(user_id, start_date_str, end_date_str, dimension
         return False, f"生成失败: {str(e)}"
     finally:
         conn.close()
-        
+ 
+# ==========================================
+# 8. 用户公告板 (新增)
+# ==========================================
+
+def get_user_notice(user_id):
+    """获取用户的个人公告"""
+    conn = get_db_connection()
+    try:
+        row = conn.execute('SELECT personal_notice FROM users WHERE user_id = ?', (user_id,)).fetchone()
+        return row['personal_notice'] if row and row['personal_notice'] else ""
+    except Exception:
+        return ""
+    finally:
+        conn.close()
+
+def update_user_notice(user_id, new_notice):
+    """更新用户的个人公告"""
+    conn = get_db_connection()
+    try:
+        conn.execute('UPDATE users SET personal_notice = ? WHERE user_id = ?', (new_notice, user_id))
+        conn.commit()
+        return True
+    except Exception as e:
+        return False
+    finally:
+        conn.close()
+                
 def send_email_backup(filepath, settings):
     """发送数据库备份邮件"""
     try:
