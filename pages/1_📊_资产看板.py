@@ -301,7 +301,7 @@ try:
                                     y=df_bench['rebased_nav'],
                                     mode='lines',
                                     name=f'{benchmark_name} ({b_sign}{bench_ret*100:.1f}%)',
-                                    line=dict(color='#29BEF0', width=2.5), 
+                                    line=dict(color="#0E44E5", width=2.5), 
                                     opacity=0.3,
                                     hovertemplate=f'{benchmark_name}: %{{y:.4f}}<extra></extra>'
                                 ))
